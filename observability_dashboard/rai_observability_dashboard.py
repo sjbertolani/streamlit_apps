@@ -244,13 +244,13 @@ def _map_pool_name(name: str) -> str:
     if name.endswith("_MODELER"):
         return "RELATIONALAI_UI_POOL"
     if "HIGHMEM_X64" in name and not name.endswith("_SOLVER"):
-        return "LOGIC_GRAPH_REASONER"
+        return "LOGIC_GRAPH_REASONER_POOL"
     return name
 
 
 def _pool_sort_key(name: str) -> int:
     """Lower = higher in legend. REASONER pools first, RELATIONALAI pools last."""
-    if name.endswith("REASONER"):
+    if "REASONER" in name:
         return 0
     if name.startswith("RELATIONALAI"):
         return 2
