@@ -244,7 +244,7 @@ def _map_pool_name(name: str) -> str:
     if name.endswith("_MODELER"):
         return "RELATIONALAI_UI_POOL"
     if "HIGHMEM_X64" in name and not name.endswith("_SOLVER"):
-        return "RELATIONALAI_LOGIC_GRAPH_REASONER"
+        return "LOGIC_GRAPH_REASONER"
     return name
 
 
