@@ -18,7 +18,7 @@ from graph_counts import (
     make_instance_id,
     parse_instance_id,
 )
-from graph_filter import FilterSpec, compute_activity, compute_reach
+from graph_filter import FilterSpec, compute_activity, compute_reach, fetch_filtered_counts
 from semantic_parser import SemanticGraph, parse_semantic_file, parse_semantic_text
 from snowflake_client import SnowflakeClient
 
@@ -57,6 +57,8 @@ for _key, _default in [
     ("schema_counts", {}),
     ("edge_counts", {}),
     ("filter_specs", []),          # List[FilterSpec] — commutative set semantics
+    ("filtered_schema_counts", {}),
+    ("filtered_edge_counts", {}),
     ("selected_node", None),
     ("validation_results", None),
 ]:
@@ -245,6 +247,8 @@ if st.session_state.get("_last_filter_key", "") != current_fkey:
     st.session_state["_last_filter_key"] = current_fkey
     st.session_state.instance_cache = {}
     st.session_state.expanded_concepts = set()
+    st.session_state.filtered_schema_counts = {}
+    st.session_state.filtered_edge_counts = {}
     instance_cache = {}
     expanded_concepts = set()
 
@@ -265,6 +269,15 @@ else:
     node_active = {}
     edge_active = {}
 
+# Filtered counts: fetch once per filter key change, then cache in session state
+if filter_specs and sf_client and not st.session_state.filtered_schema_counts:
+    fsc, fec = fetch_filtered_counts(sf_client, graph, all_reaches)
+    st.session_state.filtered_schema_counts = fsc
+    st.session_state.filtered_edge_counts = fec
+
+filtered_schema_counts: dict = st.session_state.filtered_schema_counts
+filtered_edge_counts: dict = st.session_state.filtered_edge_counts
+
 # Root concepts = anchor of any active filter spec
 root_concepts = {fs.concept for fs in filter_specs}
 
@@ -278,7 +291,11 @@ for concept in graph.concepts.values():
     is_expanded = concept.name in expanded_concepts
 
     color = "#E4A951" if is_root else ("#c9c9c9" if not active else "#0e5a6f")
-    count = schema_counts.get(concept.name)
+    count = (
+        filtered_schema_counts.get(concept.name)
+        if filter_specs
+        else schema_counts.get(concept.name)
+    )
     label = f"{concept.name} ({fmt_count(count)})" if count is not None else concept.name
 
     tip_lines = [f"Table: {concept.base_table or '?'}", f"ID cols: {', '.join(concept.id_columns) or '?'}"]
@@ -324,7 +341,11 @@ for concept in graph.concepts.values():
 
 for idx, rel in enumerate(graph.relationships):
     active = edge_active.get(idx, True)
-    count = edge_counts.get(idx)
+    count = (
+        filtered_edge_counts.get(idx)
+        if filter_specs
+        else edge_counts.get(idx)
+    )
     label = f"{rel.name} ({fmt_count(count)})" if count is not None else rel.name
     edges.append(Edge(
         source=rel.source, target=rel.target, label=label,
@@ -447,7 +468,7 @@ with col_ctrl:
                 else:
                     label = f"▼ Expand instances {'(filtered) ' if is_filtered_expand else ''}(up to {INSTANCE_LIMIT})"
                     if st.button(label, key="btn_expand", type="primary"):
-                        if display_node not in instance_cache:
+                        if display_node not in instance_cache or is_filtered_expand:
                             with st.spinner("Fetching instances…"):
                                 if is_filtered_expand:
                                     df = fetch_filtered_instances(

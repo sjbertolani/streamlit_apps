@@ -162,6 +162,67 @@ def compute_reach(
     return reach
 
 
+def fetch_filtered_counts(
+    sf_client,
+    graph: SemanticGraph,
+    all_reaches: List[Dict[str, "ReachQuery"]],
+) -> Tuple[Dict[str, int], Dict[int, int]]:
+    """
+    Return ({concept_name: count}, {rel_idx: count}) for the unioned reach across
+    all active filter specs.  Counts are the number of instances/edges reachable
+    from the filter anchors, not the full table sizes.
+    """
+    # Union reaches per concept across all filter specs
+    combined: Dict[str, ReachQuery] = {}
+    for reach in all_reaches:
+        for name, rq in reach.items():
+            if name not in combined:
+                combined[name] = rq
+            else:
+                existing = combined[name]
+                if set(rq.cols) == set(existing.cols):
+                    combined[name] = ReachQuery(
+                        sql=(
+                            f"SELECT DISTINCT * FROM ({existing.sql}) "
+                            f"UNION SELECT DISTINCT * FROM ({rq.sql})"
+                        ),
+                        cols=existing.cols,
+                    )
+
+    schema_counts: Dict[str, int] = {}
+    for name, rq in combined.items():
+        try:
+            df = sf_client.query_df(f"SELECT COUNT(*) AS n FROM ({rq.sql})")
+            schema_counts[name] = int(df.iloc[0, 0])
+        except Exception:
+            schema_counts[name] = -1
+
+    edge_counts: Dict[int, int] = {}
+    for idx, rel in enumerate(graph.relationships):
+        if rel.source not in combined or rel.target not in combined:
+            continue
+        if not rel.rel_table:
+            continue
+        reach_a = combined[rel.source]
+        reach_b = combined[rel.target]
+        cond_a = _join_condition("r", "a", rel.source_join, reach_a.cols)
+        cond_b = _join_condition("r", "b", rel.target_join, reach_b.cols)
+        if not cond_a or not cond_b:
+            continue
+        sql = (
+            f"SELECT COUNT(*) AS n FROM {rel.rel_table} r "
+            f"JOIN ({reach_a.sql}) a ON {cond_a} "
+            f"JOIN ({reach_b.sql}) b ON {cond_b}"
+        )
+        try:
+            df = sf_client.query_df(sql)
+            edge_counts[idx] = int(df.iloc[0, 0])
+        except Exception:
+            edge_counts[idx] = -1
+
+    return schema_counts, edge_counts
+
+
 def compute_activity(
     graph: SemanticGraph,
     sf_client,
