@@ -18,7 +18,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from streamlit.testing.v1 import AppTest
 
-APP_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+APP_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "rai_observability_dashboard.py",
+)
 
 
 # ── Mock DataFrames (module-level constants — built once) ─────────────────────
@@ -120,9 +123,26 @@ def _make_side_effect():
     return _side_effect
 
 
+def _make_mock_cursor(side_effect_fn):
+    """Build a mock snowflake cursor that dispatches on SQL content."""
+    def _execute(sql, *args, **kwargs):
+        df = side_effect_fn(sql)
+        mock_cursor._df = df
+        mock_cursor.description = [(col,) for col in df.columns] if not df.empty else []
+        mock_cursor.fetchall.return_value = [tuple(row) for row in df.values]
+
+    mock_cursor = MagicMock()
+    mock_cursor.execute.side_effect = _execute
+    mock_cursor.__enter__ = lambda s: mock_cursor
+    mock_cursor.__exit__ = MagicMock(return_value=False)
+    return mock_cursor
+
+
 def _run_app() -> AppTest:
     """Spin up and run the app with mocked queries. Returns the AppTest."""
-    with patch("connection.run_query", side_effect=_make_side_effect()):
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = _make_mock_cursor(_make_side_effect())
+    with patch("snowflake.connector.connect", return_value=mock_conn):
         at = AppTest.from_file(APP_PATH, default_timeout=30)
         at.run()
     return at
@@ -163,7 +183,9 @@ class TestSidebarControls:
 
     def test_custom_dates_shows_date_inputs(self):
         """Selecting 'Custom dates' reveals two date_input widgets."""
-        with patch("connection.run_query", side_effect=_make_side_effect()):
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = _make_mock_cursor(_make_side_effect())
+        with patch("snowflake.connector.connect", return_value=mock_conn):
             at = AppTest.from_file(APP_PATH, default_timeout=30)
             at.run()
             at.sidebar.selectbox[0].set_value("Custom dates").run()
@@ -189,28 +211,35 @@ class TestMetricCards:
 
 class TestConnectionModule:
     def test_run_query_returns_dataframe(self):
-        import connection
+        import rai_observability_dashboard as dash
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_cursor.description = [("COL",)]
         mock_cursor.fetchall.return_value = [(1,)]
         mock_conn.cursor.return_value.__enter__ = lambda s: mock_cursor
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-        with patch("connection._get_connection", return_value=mock_conn):
-            result = connection.run_query("SELECT 1 AS COL")
+        with patch("rai_observability_dashboard._get_connection", return_value=mock_conn):
+            result = dash.run_query("SELECT 1 AS COL")
             assert isinstance(result, pd.DataFrame)
 
     def test_queries_module_has_required_keys(self):
-        import queries
-        required = [
-            "memory_realtime", "memory_hourly", "memory_daily",
-            "cpu_realtime", "cpu_hourly",
-            "demand_realtime", "demand_hourly", "demand_daily", "active_reasoners_over_time",
-            "compute_pool_credits", "compute_pool_credits_daily",
-        ]
-        for key in required:
-            assert hasattr(queries, key), f"queries.py missing: {key}"
-            assert isinstance(getattr(queries, key), str), f"queries.{key} should be a string"
+        import rai_observability_dashboard as dash
+        required = {
+            "memory_realtime": "_Q_MEMORY_REALTIME",
+            "memory_hourly": "_Q_MEMORY_HOURLY",
+            "memory_daily": "_Q_MEMORY_DAILY",
+            "cpu_realtime": "_Q_CPU_REALTIME",
+            "cpu_hourly": "_Q_CPU_HOURLY",
+            "demand_realtime": "_Q_DEMAND_REALTIME",
+            "demand_hourly": "_Q_DEMAND_HOURLY",
+            "demand_daily": "_Q_DEMAND_DAILY",
+            "active_reasoners_over_time": "_Q_ACTIVE_REASONERS",
+            "compute_pool_credits": "_Q_CREDITS_TOTAL",
+            "compute_pool_credits_daily": "_Q_CREDITS_DAILY",
+        }
+        for friendly, attr in required.items():
+            assert hasattr(dash, attr), f"rai_observability_dashboard.py missing: {attr} (for {friendly})"
+            assert isinstance(getattr(dash, attr), str), f"{attr} should be a string"
 
 
 class TestGlobalReasonerFilter:
@@ -231,16 +260,14 @@ class TestDemandSubTabs:
         assert not app.exception
 
     def test_demand_queries_have_hourly_daily(self):
-        import queries
-        for attr in ("demand_hourly", "demand_daily"):
-            assert hasattr(queries, attr), f"queries.py missing {attr}"
+        import rai_observability_dashboard as dash
         # Hourly should group by hour
-        assert "date_trunc('hour'" in queries.demand_hourly.lower()
+        assert "date_trunc('hour'" in dash._Q_DEMAND_HOURLY.lower()
         # Daily should group by day
-        assert "date_trunc('day'" in queries.demand_daily.lower()
+        assert "date_trunc('day'" in dash._Q_DEMAND_DAILY.lower()
         # Both must have a lookback placeholder
-        assert "{lookback_hours}" in queries.demand_hourly
-        assert "{lookback_days}" in queries.demand_daily
+        assert "{lookback_hours}" in dash._Q_DEMAND_HOURLY
+        assert "{lookback_days}" in dash._Q_DEMAND_DAILY
 
 
 class TestCreditsDateFilter:
@@ -248,17 +275,17 @@ class TestCreditsDateFilter:
         assert not app.exception
 
     def test_credits_daily_query_has_date_trunc(self):
-        import queries
-        assert hasattr(queries, "compute_pool_credits_daily"), \
-            "queries.py missing compute_pool_credits_daily"
-        q = queries.compute_pool_credits_daily.lower()
+        import rai_observability_dashboard as dash
+        q = dash._Q_CREDITS_DAILY.lower()
         assert "date_trunc" in q, "credits daily query should truncate by date"
         assert "start_time" in q or "end_time" in q or "usage_date" in q, \
             "credits daily query should filter on a date column"
 
     def test_credits_sidebar_date_inputs_appear_for_custom(self):
         """Date inputs only appear when 'Custom dates' is selected."""
-        with patch("connection.run_query", side_effect=_make_side_effect()):
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = _make_mock_cursor(_make_side_effect())
+        with patch("snowflake.connector.connect", return_value=mock_conn):
             at = AppTest.from_file(APP_PATH, default_timeout=30)
             at.run()
             # No date inputs in default (Last 24 hours) mode
