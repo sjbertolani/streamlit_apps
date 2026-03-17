@@ -248,6 +248,21 @@ def _map_pool_name(name: str) -> str:
     return name
 
 
+def _pool_sort_key(name: str) -> int:
+    """Lower = higher in legend. REASONER pools first, RELATIONALAI pools last."""
+    if name.endswith("REASONER"):
+        return 0
+    if name.startswith("RELATIONALAI"):
+        return 2
+    return 1
+
+
+def _pool_category_order(df: pd.DataFrame) -> list[str]:
+    """Return pool names sorted for use in plotly category_orders."""
+    pools = sorted(df["COMPUTE_POOL_NAME"].unique(), key=_pool_sort_key)
+    return pools
+
+
 def _apply_pool_mapping(df: pd.DataFrame) -> pd.DataFrame:
     """Aggregate credits after mapping compute pool names, summing any pools that merge."""
     if df.empty or "COMPUTE_POOL_NAME" not in df.columns:
@@ -562,8 +577,10 @@ with tab_credits:
         st.divider()
 
         if not df_credits_daily.empty and "DAY" in df_credits_daily.columns:
+            _pool_order = _pool_category_order(df_credits_daily)
             fig_trend = px.bar(df_credits_daily, x="DAY", y="CREDITS_USED", color="COMPUTE_POOL_NAME",
                                barmode="stack",
+                               category_orders={"COMPUTE_POOL_NAME": _pool_order},
                                labels={"CREDITS_USED": "Credits Used", "DAY": "Date", "COMPUTE_POOL_NAME": "Compute Pool"},
                                title="Daily Credit Consumption by Compute Pool")
             daily_total = df_credits_daily.groupby("DAY")["CREDITS_USED"].sum().reset_index()
