@@ -1,0 +1,12 @@
+name: semantic-graph-viz
+channels:
+  - snowflake
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - streamlit
+  - pandas
+  - snowflake-snowpark-python
+  - pip:
+    - streamlit-agraph>=0.0.45
