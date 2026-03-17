@@ -235,6 +235,29 @@ def _filter(df: pd.DataFrame, selected: list[str]) -> pd.DataFrame:
     return df[df["REASONER_NAME"].isin(selected)]
 
 
+def _map_pool_name(name: str) -> str:
+    """Map raw Snowflake compute pool names to human-readable RAI pool categories."""
+    if name in ("RELATIONAL_AI_ERP_COMPUTE_POOL", "RELATIONAL_AI_COMPILE_CACHE_SPCS"):
+        return "RELATIONALAI_INTERNAL_POOL"
+    if name.endswith("_SOLVER"):
+        return "PRESCRIPTIVE_REASONER_POOL"
+    if name.endswith("_MODELER"):
+        return "RELATIONALAI_UI_POOL"
+    if "HIGH_MEM_x64" in name and not name.endswith("_SOLVER"):
+        return "RELATIONALAI_LOGIC_GRAPH_REASONER"
+    return name
+
+
+def _apply_pool_mapping(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate credits after mapping compute pool names, summing any pools that merge."""
+    if df.empty or "COMPUTE_POOL_NAME" not in df.columns:
+        return df
+    df = df.copy()
+    df["COMPUTE_POOL_NAME"] = df["COMPUTE_POOL_NAME"].map(_map_pool_name)
+    group_cols = [c for c in df.columns if c != "CREDITS_USED"]
+    return df.groupby(group_cols, as_index=False)["CREDITS_USED"].sum()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
@@ -321,7 +344,7 @@ with tab_overview:
     df_mem_ov  = _filter(fetch(_q(_Q_MEMORY_HOURLY, lookback_hours=LOOKBACK_HOURS)), SELECTED)
     df_cpu_ov  = _filter(fetch(_q(_Q_CPU_HOURLY,    lookback_hours=LOOKBACK_HOURS)), SELECTED)
     df_dem_ov  = _filter(fetch(_q(_Q_DEMAND_HOURLY, lookback_hours=LOOKBACK_HOURS)), SELECTED)
-    df_cred_ov = fetch(_q(_Q_CREDITS_TOTAL, date_from=DATE_FROM, date_to=DATE_TO))
+    df_cred_ov = _apply_pool_mapping(fetch(_q(_Q_CREDITS_TOTAL, date_from=DATE_FROM, date_to=DATE_TO)))
 
     with col_mem:
         if not df_mem_ov.empty and "AVG_MEMORY" in df_mem_ov.columns:
@@ -524,8 +547,8 @@ with tab_credits:
     )
 
     _df = {"date_from": str(DATE_FROM), "date_to": str(DATE_TO)}
-    df_credits_total = fetch(_q(_Q_CREDITS_TOTAL, **_df))
-    df_credits_daily = fetch(_q(_Q_CREDITS_DAILY, **_df))
+    df_credits_total = _apply_pool_mapping(fetch(_q(_Q_CREDITS_TOTAL, **_df)))
+    df_credits_daily = _apply_pool_mapping(fetch(_q(_Q_CREDITS_DAILY, **_df)))
 
     if df_credits_total.empty:
         st.info("No compute pool credit data found. Ensure your role has access to `SNOWFLAKE.ACCOUNT_USAGE`.")
