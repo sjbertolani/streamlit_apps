@@ -243,7 +243,7 @@ def _map_pool_name(name: str) -> str:
         return "PRESCRIPTIVE_REASONER_POOL"
     if name.endswith("_MODELER"):
         return "RELATIONALAI_UI_POOL"
-    if "HIGH_MEM_X64" in name and not name.endswith("_SOLVER"):
+    if "HIGHMEM_X64" in name and not name.endswith("_SOLVER"):
         return "RELATIONALAI_LOGIC_GRAPH_REASONER"
     return name
 
