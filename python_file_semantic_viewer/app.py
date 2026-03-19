@@ -72,8 +72,8 @@ def _relationalai_available() -> bool:
 
 
 @st.cache_data(show_spinner=False)
-def _load_graph(text: str) -> Tuple[SemanticGraph, List[str]]:
-    return parse_semantic_text(text)
+def _load_graph(text: str, raiconfig_path: Optional[str] = None) -> Tuple[SemanticGraph, List[str]]:
+    return parse_semantic_text(text, raiconfig_path=raiconfig_path)
 
 
 def _get_selected_node(result) -> Optional[str]:
@@ -125,7 +125,12 @@ with st.sidebar:
                     tmp.write(raiconfig_file.getvalue())
                     tmp_path = tmp.name
                 st.session_state.sf_client = SnowflakeClient.from_raiconfig(tmp_path)
-                os.unlink(tmp_path)
+                # Keep the temp file alive so exec() of the semantic layer can
+                # find it via the standard relationalai config search path.
+                old_tmp = st.session_state.get("raiconfig_tmp_path")
+                if old_tmp and os.path.exists(old_tmp):
+                    os.unlink(old_tmp)
+                st.session_state.raiconfig_tmp_path = tmp_path
                 st.session_state.sf_connected = True
                 for k in ["schema_counts", "edge_counts", "instance_cache", "sample_cache"]:
                     st.session_state[k] = {}
@@ -169,7 +174,10 @@ with st.sidebar:
         st.stop()
 
     try:
-        graph, parse_diags = _load_graph(uploaded_file.getvalue().decode("utf-8", errors="ignore"))
+        graph, parse_diags = _load_graph(
+            uploaded_file.getvalue().decode("utf-8", errors="ignore"),
+            raiconfig_path=st.session_state.get("raiconfig_tmp_path"),
+        )
         ca.metric("Concepts", len(graph.concepts))
         cb.metric("Relationships", len(graph.relationships))
     except Exception as exc:

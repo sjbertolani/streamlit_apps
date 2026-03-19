@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import traceback
 from dataclasses import dataclass, field
@@ -332,45 +333,67 @@ def _exec_and_find_model(namespace: Dict[str, object], text: str, diags: List[st
     return val
 
 
-def _exec_model(text: str, diags: List[str]):
+def _exec_model(text: str, diags: List[str], raiconfig_path: Optional[str] = None):
     """
     Execute PyRel model source and return the Model instance.
 
-    First tries a plain exec. If that fails (e.g. because the file calls
-    rai.Config() / rai.Model() at module level and the raiconfig file is not
-    in a default location), retries with relationalai.Config mocked out so
-    that config-file reads are skipped. The Model's schema definitions
-    (concepts, defines) are purely in-memory and do not require a real config.
+    Attempt order:
+    1. If raiconfig_path is provided, copy it to ~/raiconfig.yaml so the
+       relationalai library finds it at its default search location, then exec.
+    2. Plain exec (works if the user already has raiconfig in a default location).
+    3. Retry with relationalai.Config mocked (last resort).
     """
-    diags.append("[EXEC] Compiling source…")
-    compiled = compile(text, "<semantic_model>", "exec")
+    import shutil
 
-    # ── Attempt 1: plain exec ─────────────────────────────────────────────────
+    diags.append("[EXEC] Compiling source…")
+
+    # ── Attempt 1: place raiconfig at ~/raiconfig.yaml before exec ────────────
+    if raiconfig_path and os.path.exists(raiconfig_path):
+        home_config = os.path.expanduser("~/raiconfig.yaml")
+        backed_up = False
+        backup_path = home_config + ".bak_semviewer"
+        try:
+            if os.path.exists(home_config) and not os.path.samefile(raiconfig_path, home_config):
+                shutil.copy2(home_config, backup_path)
+                backed_up = True
+            if not os.path.exists(home_config) or not os.path.samefile(raiconfig_path, home_config):
+                shutil.copy2(raiconfig_path, home_config)
+                diags.append(f"[EXEC] Copied raiconfig to {home_config}")
+            namespace: Dict[str, object] = {}
+            result = _exec_and_find_model(namespace, text, diags)
+            return result
+        except Exception as exc1:
+            diags.append(f"[EXEC] Exec with raiconfig at home failed — {type(exc1).__name__}: {exc1}")
+            for line in traceback.format_exc().splitlines():
+                diags.append(f"  {line}")
+        finally:
+            if backed_up and os.path.exists(backup_path):
+                shutil.move(backup_path, home_config)
+
+    # ── Attempt 2: plain exec ─────────────────────────────────────────────────
+    diags.append("[EXEC] Trying plain exec…")
     try:
-        namespace: Dict[str, object] = {}
+        namespace = {}
         return _exec_and_find_model(namespace, text, diags)
-    except Exception as exc1:
-        diags.append(f"[EXEC] Plain exec failed — {type(exc1).__name__}: {exc1}")
+    except Exception as exc2:
+        diags.append(f"[EXEC] Plain exec failed — {type(exc2).__name__}: {exc2}")
         for line in traceback.format_exc().splitlines():
             diags.append(f"  {line}")
 
-    # ── Attempt 2: retry with relationalai.Config mocked ─────────────────────
-    diags.append("[EXEC] Retrying with relationalai.Config mocked (skipping config-file read)…")
+    # ── Attempt 3: retry with relationalai.Config mocked ─────────────────────
+    diags.append("[EXEC] Retrying with relationalai.Config mocked…")
     try:
         import relationalai as _rai_mod
         from unittest.mock import MagicMock, patch
 
-        # Patch Config at the module level so any import style works:
-        #   import relationalai as rai; rai.Config(...)
-        #   from relationalai import Config; Config(...)
         with patch.object(_rai_mod, "Config", MagicMock(return_value=MagicMock())):
             namespace = {}
             return _exec_and_find_model(namespace, text, diags)
-    except Exception as exc2:
-        diags.append(f"[EXEC] Mocked-config exec also failed — {type(exc2).__name__}: {exc2}")
+    except Exception as exc3:
+        diags.append(f"[EXEC] Mocked-config exec also failed — {type(exc3).__name__}: {exc3}")
         for line in traceback.format_exc().splitlines():
             diags.append(f"  {line}")
-        raise exc2
+        raise exc3
 
 
 # ── Regex fallback parser ─────────────────────────────────────────────────────
@@ -585,7 +608,7 @@ def _parse_semantic_text_regex(text: str, diags: List[str]) -> SemanticGraph:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def parse_semantic_text(text: str) -> Tuple[SemanticGraph, List[str]]:
+def parse_semantic_text(text: str, raiconfig_path: Optional[str] = None) -> Tuple[SemanticGraph, List[str]]:
     """
     Parse a PyRel semantic layer Python file.
 
@@ -601,7 +624,7 @@ def parse_semantic_text(text: str) -> Tuple[SemanticGraph, List[str]]:
     diags: List[str] = []
     try:
         diags.append("[EXEC] Attempting metamodel path…")
-        model = _exec_model(text, diags)
+        model = _exec_model(text, diags, raiconfig_path=raiconfig_path)
         diags.append("[MM] Running _parse_from_model…")
         graph = _parse_from_model(model, diags)
         diags.append(
