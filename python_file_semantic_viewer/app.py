@@ -122,6 +122,33 @@ with st.sidebar:
         st.error(str(exc))
         st.stop()
 
+    if not graph.concepts:
+        st.warning("No concepts found — the file may use an unsupported format.")
+    if not graph.relationships:
+        st.warning("No relationships found.")
+    if not graph.tables:
+        st.warning("No source tables found — Validate Tables will have nothing to check.")
+
+    with st.expander("Parse diagnostics", expanded=False):
+        st.markdown("**Concepts**")
+        if graph.concepts:
+            for name, c in graph.concepts.items():
+                st.caption(f"· {name} — table: `{c.base_table or '?'}` id_cols: `{c.id_columns or []}`")
+        else:
+            st.caption("none")
+        st.markdown("**Relationships**")
+        if graph.relationships:
+            for r in graph.relationships:
+                st.caption(f"· `{r.name}` {r.source} → {r.target} (rel_table: `{r.rel_table or '?'}`)")
+        else:
+            st.caption("none")
+        st.markdown("**Source tables**")
+        if graph.tables:
+            for t in graph.tables:
+                st.caption(f"· `{t}`")
+        else:
+            st.caption("none")
+
     st.divider()
     st.subheader("Snowflake")
     detected = "/Users/stevebertolani/software/field-pov/Demos/demo_code_assist/config/raiconfig.toml"
