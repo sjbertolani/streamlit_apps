@@ -305,15 +305,23 @@ def _split_args(arg_str: str) -> List[str]:
     return parts
 
 
-def _parse_column_ref(ref: str) -> Optional[Tuple[str, str]]:
-    parts = ref.split(".")
+def _parse_column_ref(ref: str, table_map: Optional[Dict[str, str]] = None) -> Optional[Tuple[str, str]]:
+    parts = [p.strip() for p in ref.split(".")]
     if len(parts) < 3:
         return None
-    column = parts[-1].strip()
-    table_var = parts[-2].strip()
+    column = parts[-1]
     if not _is_valid_identifier(column):
         return None
-    return table_var, column
+    # Walk right-to-left through the chain to find a part that's a known table
+    # var. This handles deeply nested Sources classes like:
+    #   Sources.team.schema.rma_analysis.column_name
+    # where the table var (rma_analysis) could be at any depth.
+    if table_map:
+        for i in range(len(parts) - 2, 0, -1):
+            if parts[i] in table_map:
+                return parts[i], column
+    # Fallback: assume second-to-last part is the table var
+    return parts[-2], column
 
 
 def _parse_semantic_text_regex(text: str) -> SemanticGraph:
@@ -322,7 +330,20 @@ def _parse_semantic_text_regex(text: str) -> SemanticGraph:
     concepts: Dict[str, ConceptInfo] = {}
     relationships: List[RelationshipInfo] = []
 
-    table_re = re.compile(r"^(?P<var>\w+)\s*=\s*model\.Table\(\"(?P<table>[^\"]+)\"\)")
+    # Scan the full source text for model.Table(...) assignments.
+    # Handles multi-line calls and indented definitions inside nested classes:
+    #   class Sources:
+    #       class team:
+    #           rma_analysis = model.Table(
+    #               "DB.SCHEMA.TABLE"
+    #           )
+    _table_full_re = re.compile(
+        r"^\s*(\w+)\s*=\s*model\.Table\(\s*[\"']([^\"']+)[\"']\s*\)",
+        re.MULTILINE,
+    )
+    for m in _table_full_re.finditer(text):
+        table_map[m.group(1)] = m.group(2)
+
     concept_re = re.compile(r"^(?P<concept>\w+)\s*=\s*model\.Concept\(\"(?P<label>[^\"]+)\"")
     define_new_re = re.compile(r"^model\.define\((?P<concept>\w+)\.new\((?P<args>.*)\)\)\s*$")
     define_re = re.compile(r"^model\.define\((?P<body>.+)\)\s*$")
@@ -334,10 +355,6 @@ def _parse_semantic_text_regex(text: str) -> SemanticGraph:
     ]
 
     for line in lines:
-        m = table_re.match(line)
-        if m:
-            table_map[m.group("var")] = m.group("table")
-            continue
         m = concept_re.match(line)
         if m:
             concepts[m.group("concept")] = ConceptInfo(name=m.group("concept"))
@@ -356,7 +373,7 @@ def _parse_semantic_text_regex(text: str) -> SemanticGraph:
             key = key.strip()
             ref = None
             for src_ref in _extract_sources_refs(value.strip()):
-                parsed = _parse_column_ref(src_ref)
+                parsed = _parse_column_ref(src_ref, table_map)
                 if parsed:
                     ref = parsed
                     break
@@ -387,7 +404,7 @@ def _parse_semantic_text_regex(text: str) -> SemanticGraph:
         target_concepts = re.findall(r"(\w+)\.filter_by\(", args_str)
         col_refs: List[Tuple[str, str]] = []
         for ref in _extract_sources_refs(args_str):
-            parsed = _parse_column_ref(ref)
+            parsed = _parse_column_ref(ref, table_map)
             if parsed:
                 col_refs.append(parsed)
 
