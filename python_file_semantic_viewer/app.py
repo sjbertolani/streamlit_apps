@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from typing import Optional
 
 import pandas as pd
@@ -168,15 +169,18 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Snowflake")
-    detected = "/Users/stevebertolani/software/field-pov/Demos/demo_code_assist/config/raiconfig.toml"
-    config_path = st.text_input(
-        "raiconfig path (.toml or .yaml)",
-        value=detected if os.path.exists(detected) else "./raiconfig.toml",
+    raiconfig_file = st.file_uploader(
+        "raiconfig (.toml or .yaml)", type=["toml", "yaml", "yml"], key="raiconfig_upload"
     )
-    if st.button("Connect", key="btn_connect"):
+    if st.button("Connect", key="btn_connect", disabled=raiconfig_file is None):
         with st.spinner("Connecting…"):
             try:
-                st.session_state.sf_client = SnowflakeClient.from_raiconfig(config_path)
+                suffix = os.path.splitext(raiconfig_file.name)[1]
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(raiconfig_file.getvalue())
+                    tmp_path = tmp.name
+                st.session_state.sf_client = SnowflakeClient.from_raiconfig(tmp_path)
+                os.unlink(tmp_path)
                 st.session_state.sf_connected = True
                 for k in ["schema_counts", "edge_counts", "instance_cache", "sample_cache"]:
                     st.session_state[k] = {}
