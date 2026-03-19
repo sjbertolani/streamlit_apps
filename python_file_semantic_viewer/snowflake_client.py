@@ -30,8 +30,14 @@ class SnowflakeClient:
         else:
             with open(path, "rb") as f:
                 data = tomllib.load(f)
-        profile_name = data.get("active_profile", "default")
-        profile = data.get("profile", {}).get(profile_name, {})
+        # Support two YAML/TOML layouts:
+        #   RAI layout:      active_profile / profile.<name>
+        #   Snowflake CLI:   default_connection / connections.<name>
+        profile_name = data.get("active_profile") or data.get("default_connection", "default")
+        profile = (
+            data.get("profile", {}).get(profile_name)
+            or data.get("connections", {}).get(profile_name)
+        )
         if not profile:
             raise ValueError(f"Profile '{profile_name}' not found in raiconfig")
 
