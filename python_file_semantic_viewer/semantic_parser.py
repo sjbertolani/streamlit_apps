@@ -313,10 +313,8 @@ def _parse_from_model(model, diags: List[str]) -> SemanticGraph:
     return SemanticGraph(concepts=concepts, relationships=relationships, tables=tables)
 
 
-def _exec_model(text: str, diags: List[str]):
-    """Execute PyRel model source and return the Model instance."""
-    diags.append("[EXEC] Compiling source…")
-    namespace: Dict[str, object] = {}
+def _exec_and_find_model(namespace: Dict[str, object], text: str, diags: List[str]):
+    """Exec compiled source into namespace and return the first Model found."""
     exec(compile(text, "<semantic_model>", "exec"), namespace)  # noqa: S102
     candidates = [
         (k, v) for k, v in namespace.items()
@@ -332,6 +330,47 @@ def _exec_model(text: str, diags: List[str]):
     name, val = candidates[0]
     diags.append(f"[EXEC] Using model: '{name}'  type={type(val).__name__}")
     return val
+
+
+def _exec_model(text: str, diags: List[str]):
+    """
+    Execute PyRel model source and return the Model instance.
+
+    First tries a plain exec. If that fails (e.g. because the file calls
+    rai.Config() / rai.Model() at module level and the raiconfig file is not
+    in a default location), retries with relationalai.Config mocked out so
+    that config-file reads are skipped. The Model's schema definitions
+    (concepts, defines) are purely in-memory and do not require a real config.
+    """
+    diags.append("[EXEC] Compiling source…")
+    compiled = compile(text, "<semantic_model>", "exec")
+
+    # ── Attempt 1: plain exec ─────────────────────────────────────────────────
+    try:
+        namespace: Dict[str, object] = {}
+        return _exec_and_find_model(namespace, text, diags)
+    except Exception as exc1:
+        diags.append(f"[EXEC] Plain exec failed — {type(exc1).__name__}: {exc1}")
+        for line in traceback.format_exc().splitlines():
+            diags.append(f"  {line}")
+
+    # ── Attempt 2: retry with relationalai.Config mocked ─────────────────────
+    diags.append("[EXEC] Retrying with relationalai.Config mocked (skipping config-file read)…")
+    try:
+        import relationalai as _rai_mod
+        from unittest.mock import MagicMock, patch
+
+        # Patch Config at the module level so any import style works:
+        #   import relationalai as rai; rai.Config(...)
+        #   from relationalai import Config; Config(...)
+        with patch.object(_rai_mod, "Config", MagicMock(return_value=MagicMock())):
+            namespace = {}
+            return _exec_and_find_model(namespace, text, diags)
+    except Exception as exc2:
+        diags.append(f"[EXEC] Mocked-config exec also failed — {type(exc2).__name__}: {exc2}")
+        for line in traceback.format_exc().splitlines():
+            diags.append(f"  {line}")
+        raise exc2
 
 
 # ── Regex fallback parser ─────────────────────────────────────────────────────
