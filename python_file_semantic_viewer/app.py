@@ -126,7 +126,7 @@ with st.sidebar:
     st.subheader("Snowflake")
     detected = "/Users/stevebertolani/software/field-pov/Demos/demo_code_assist/config/raiconfig.toml"
     config_path = st.text_input(
-        "raiconfig.toml path",
+        "raiconfig path (.toml or .yaml)",
         value=detected if os.path.exists(detected) else "./raiconfig.toml",
     )
     if st.button("Connect", key="btn_connect"):

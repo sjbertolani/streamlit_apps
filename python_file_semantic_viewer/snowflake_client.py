@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 import os
 import tomllib
+import yaml
 
 import pandas as pd
 import snowflake.connector
@@ -23,8 +24,12 @@ class SnowflakeClient:
 
     @classmethod
     def from_raiconfig(cls, path: str) -> "SnowflakeClient":
-        with open(path, "rb") as f:
-            data = tomllib.load(f)
+        if path.endswith((".yaml", ".yml")):
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+        else:
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
         profile_name = data.get("active_profile", "default")
         profile = data.get("profile", {}).get(profile_name, {})
         if not profile:

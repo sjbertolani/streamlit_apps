@@ -3,3 +3,4 @@ streamlit-agraph>=0.0.45
 pandas
 snowflake-connector-python[pandas]
 relationalai
+pyyaml
