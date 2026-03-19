@@ -21,8 +21,9 @@ uv venv --python /Users/stevebertolani/anaconda3/bin/python
 # Install all dependencies
 uv pip install -r requirements.txt
 
-# Run the app
-uv run streamlit run app.py
+# Run the app (use python -m to ensure the venv's streamlit is used, not any
+# globally installed one)
+uv run python -m streamlit run app.py
 ```
 
 The app opens at http://localhost:8501.

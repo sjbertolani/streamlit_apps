@@ -383,7 +383,7 @@ def _bottom_panel(graph: SemanticGraph) -> None:
                             if not row.empty:
                                 kv = row.iloc[0].to_frame("Value").reset_index()
                                 kv.columns = ["Column", "Value"]
-                                st.dataframe(kv, use_container_width=True)
+                                st.dataframe(kv, width="stretch")
                             else:
                                 st.info("Row not found in cached data.")
                 else:
@@ -419,7 +419,7 @@ def _bottom_panel(graph: SemanticGraph) -> None:
                     elif df.empty:
                         st.info("No rows returned.")
                     else:
-                        st.dataframe(df, use_container_width=True)
+                        st.dataframe(df, width="stretch")
                 elif not sf_client:
                     st.info("Connect to Snowflake to view sample data.")
 
