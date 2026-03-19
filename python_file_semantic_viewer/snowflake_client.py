@@ -100,6 +100,9 @@ class SnowflakeClient:
             except Exception as exc:
                 return TableStatus(table=table, exists=False, has_data=False, error=str(exc))
 
+        if not table_list:
+            return []
+
         results_map: Dict[str, TableStatus] = {}
         with ThreadPoolExecutor(max_workers=min(len(table_list), 8)) as pool:
             futures = {pool.submit(_check, t): t for t in table_list}
