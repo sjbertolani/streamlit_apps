@@ -324,6 +324,37 @@ def _parse_column_ref(ref: str, table_map: Optional[Dict[str, str]] = None) -> O
     return parts[-2], column
 
 
+def _extract_define_bodies(text: str) -> List[str]:
+    """
+    Extract the inner content of every model.define(...) call from the full
+    source text, tracking parenthesis depth so multi-line defines are handled
+    correctly. Returns each body as a single whitespace-collapsed string.
+    """
+    bodies: List[str] = []
+    marker = "model.define("
+    search_from = 0
+    while True:
+        start = text.find(marker, search_from)
+        if start == -1:
+            break
+        i = start + len(marker) - 1  # position of opening '('
+        depth = 0
+        body_start = i + 1
+        while i < len(text):
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    raw = text[body_start:i]
+                    # Collapse whitespace (newlines, indent) into single spaces
+                    bodies.append(re.sub(r"\s+", " ", raw).strip())
+                    break
+            i += 1
+        search_from = i + 1
+    return bodies
+
+
 def _parse_semantic_text_regex(text: str) -> SemanticGraph:
     """Regex-based parser — fallback when exec of the model code is not possible."""
     table_map: Dict[str, str] = {}
@@ -331,12 +362,7 @@ def _parse_semantic_text_regex(text: str) -> SemanticGraph:
     relationships: List[RelationshipInfo] = []
 
     # Scan the full source text for model.Table(...) assignments.
-    # Handles multi-line calls and indented definitions inside nested classes:
-    #   class Sources:
-    #       class team:
-    #           rma_analysis = model.Table(
-    #               "DB.SCHEMA.TABLE"
-    #           )
+    # Handles multi-line calls and indented definitions inside nested classes.
     _table_full_re = re.compile(
         r"^\s*(\w+)\s*=\s*model\.Table\(\s*[\"']([^\"']+)[\"']\s*\)",
         re.MULTILINE,
@@ -344,53 +370,55 @@ def _parse_semantic_text_regex(text: str) -> SemanticGraph:
     for m in _table_full_re.finditer(text):
         table_map[m.group(1)] = m.group(2)
 
+    # Concepts — still reliably single-line at module level
     concept_re = re.compile(r"^(?P<concept>\w+)\s*=\s*model\.Concept\(\"(?P<label>[^\"]+)\"")
-    define_new_re = re.compile(r"^model\.define\((?P<concept>\w+)\.new\((?P<args>.*)\)\)\s*$")
-    define_re = re.compile(r"^model\.define\((?P<body>.+)\)\s*$")
-
-    lines = [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
-
-    for line in lines:
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
         m = concept_re.match(line)
         if m:
             concepts[m.group("concept")] = ConceptInfo(name=m.group("concept"))
 
-    for line in lines:
-        m = define_new_re.match(line)
-        if not m:
-            continue
-        concept_name = m.group("concept")
-        id_cols: List[str] = []
-        base_table: Optional[str] = None
-        for part in _split_args(m.group("args")):
-            if "=" not in part:
-                continue
-            key, value = part.split("=", 1)
-            key = key.strip()
-            ref = None
-            for src_ref in _extract_sources_refs(value.strip()):
-                parsed = _parse_column_ref(src_ref, table_map)
-                if parsed:
-                    ref = parsed
-                    break
-            if ref:
-                table_var, _ = ref
-                if base_table is None:
-                    base_table = table_map.get(table_var)
-                id_cols.append(key)
-        if concept_name in concepts:
-            concepts[concept_name].id_columns = id_cols
-            concepts[concept_name].base_table = base_table
+    # Extract all model.define(...) bodies as normalised single-line strings,
+    # then apply the same patterns as before against each body.
+    define_new_re = re.compile(r"^(?P<concept>\w+)\.new\((?P<args>.+)\)\s*$")
+    define_rel_re = re.compile(r"^(?P<body>.+)$")
 
-    for line in lines:
-        m = define_re.match(line)
-        if not m:
+    for body in _extract_define_bodies(text):
+        # ── Concept identity define: Concept.new(id=Sources...) ──────────
+        m = define_new_re.match(body)
+        if m:
+            concept_name = m.group("concept")
+            id_cols: List[str] = []
+            base_table: Optional[str] = None
+            for part in _split_args(m.group("args")):
+                if "=" not in part:
+                    continue
+                key, value = part.split("=", 1)
+                key = key.strip()
+                ref = None
+                for src_ref in _extract_sources_refs(value.strip()):
+                    parsed = _parse_column_ref(src_ref, table_map)
+                    if parsed:
+                        ref = parsed
+                        break
+                if ref:
+                    table_var, _ = ref
+                    if base_table is None:
+                        base_table = table_map.get(table_var)
+                    id_cols.append(key)
+            if concept_name in concepts:
+                concepts[concept_name].id_columns = id_cols
+                concepts[concept_name].base_table = base_table
             continue
-        body = m.group("body")
+
+        # ── Relationship define: Src.filter_by(...).rel(Tgt.filter_by(...)) ─
+        src_match = re.match(r"^(?P<src>\w+)\.filter_by", body)
+        if not src_match:
+            continue
+        source = src_match.group("src")
+        body = body  # use collapsed body for all further matching
         src_match = re.match(r"^(?P<src>\w+)\.filter_by", body)
         if not src_match:
             continue
