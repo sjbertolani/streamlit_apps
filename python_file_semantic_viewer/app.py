@@ -112,6 +112,42 @@ with st.sidebar:
             icon=None,
         )
 
+    # ── Step 1: Snowflake connection ──────────────────────────────────────────
+    st.subheader("1 · Snowflake")
+    raiconfig_file = st.file_uploader(
+        "raiconfig (.toml or .yaml)", type=["toml", "yaml", "yml"], key="raiconfig_upload"
+    )
+    if st.button("Connect", key="btn_connect", disabled=raiconfig_file is None):
+        with st.spinner("Connecting…"):
+            try:
+                suffix = os.path.splitext(raiconfig_file.name)[1]
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(raiconfig_file.getvalue())
+                    tmp_path = tmp.name
+                st.session_state.sf_client = SnowflakeClient.from_raiconfig(tmp_path)
+                os.unlink(tmp_path)
+                st.session_state.sf_connected = True
+                for k in ["schema_counts", "edge_counts", "instance_cache", "sample_cache"]:
+                    st.session_state[k] = {}
+                st.session_state.validation_results = None
+                st.success("Connected!")
+            except Exception as exc:
+                st.session_state.sf_client = None
+                st.session_state.sf_connected = False
+                st.error(f"Connection failed: {exc}")
+
+    if st.session_state.get("sf_connected"):
+        st.success("✓ Snowflake connected")
+        if st.button("Test connection", key="btn_test"):
+            try:
+                st.json(st.session_state.sf_client.test_connection())
+            except Exception as exc:
+                st.error(str(exc))
+
+    st.divider()
+
+    # ── Step 2: Semantic layer ────────────────────────────────────────────────
+    st.subheader("2 · Semantic Layer")
     uploaded_file = st.file_uploader("Semantic layer Python file", type=["py"])
 
     graph_id = hash(uploaded_file.getvalue()) if uploaded_file is not None else "none"
@@ -129,7 +165,7 @@ with st.sidebar:
     if uploaded_file is None:
         ca.metric("Concepts", 0)
         cb.metric("Relationships", 0)
-        st.caption("Upload a semantic layer file to begin.")
+        st.caption("Upload a semantic layer file to continue.")
         st.stop()
 
     try:
@@ -171,38 +207,8 @@ with st.sidebar:
         st.code("\n".join(parse_diags), language=None)
 
     st.divider()
-    st.subheader("Snowflake")
-    raiconfig_file = st.file_uploader(
-        "raiconfig (.toml or .yaml)", type=["toml", "yaml", "yml"], key="raiconfig_upload"
-    )
-    if st.button("Connect", key="btn_connect", disabled=raiconfig_file is None):
-        with st.spinner("Connecting…"):
-            try:
-                suffix = os.path.splitext(raiconfig_file.name)[1]
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                    tmp.write(raiconfig_file.getvalue())
-                    tmp_path = tmp.name
-                st.session_state.sf_client = SnowflakeClient.from_raiconfig(tmp_path)
-                os.unlink(tmp_path)
-                st.session_state.sf_connected = True
-                for k in ["schema_counts", "edge_counts", "instance_cache", "sample_cache"]:
-                    st.session_state[k] = {}
-                st.session_state.validation_results = None
-                st.success("Connected!")
-            except Exception as exc:
-                st.session_state.sf_client = None
-                st.session_state.sf_connected = False
-                st.error(f"Connection failed: {exc}")
 
-    if st.session_state.get("sf_connected"):
-        st.success("✓ Snowflake connected")
-        if st.button("Test connection", key="btn_test"):
-            try:
-                st.json(st.session_state.sf_client.test_connection())
-            except Exception as exc:
-                st.error(str(exc))
-
-    st.divider()
+    # ── Source table validation ───────────────────────────────────────────────
     st.subheader("Source Tables")
     if st.session_state.get("sf_client"):
         if st.button("Validate Tables", key="btn_validate"):
