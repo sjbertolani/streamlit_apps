@@ -62,6 +62,14 @@ for _key, _default in [
         st.session_state[_key] = _default
 
 
+def _relationalai_available() -> bool:
+    try:
+        import relationalai  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 @st.cache_data(show_spinner=False)
 def _load_graph(text: str) -> SemanticGraph:
     return parse_semantic_text(text)
@@ -94,6 +102,15 @@ def _find_col(df: pd.DataFrame, col_name: str) -> Optional[str]:
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Inputs")
+
+    if not _relationalai_available():
+        st.warning(
+            "⚠️ `relationalai` is not installed — using the regex fallback parser. "
+            "Results may be incomplete for non-standard file formats. "
+            "Install with `pip install relationalai` for full accuracy.",
+            icon=None,
+        )
+
     uploaded_file = st.file_uploader("Semantic layer Python file", type=["py"])
 
     graph_id = hash(uploaded_file.getvalue()) if uploaded_file is not None else "none"
