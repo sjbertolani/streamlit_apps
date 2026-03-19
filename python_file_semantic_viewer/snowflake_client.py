@@ -82,14 +82,27 @@ class SnowflakeClient:
         return cols
 
     def validate_tables(self, tables: Iterable[str]) -> List[TableStatus]:
-        results: List[TableStatus] = []
-        for table in tables:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        table_list = list(tables)
+
+        def _check(table: str) -> TableStatus:
+            # Each thread creates its own cursor from the shared connection.
+            # Read-only concurrent cursor usage is safe in practice.
             try:
                 has_data = self.exists(f"SELECT 1 FROM {table} LIMIT 1")
-                results.append(TableStatus(table=table, exists=True, has_data=has_data))
+                return TableStatus(table=table, exists=True, has_data=has_data)
             except Exception as exc:
-                results.append(TableStatus(table=table, exists=False, has_data=False, error=str(exc)))
-        return results
+                return TableStatus(table=table, exists=False, has_data=False, error=str(exc))
+
+        results_map: Dict[str, TableStatus] = {}
+        with ThreadPoolExecutor(max_workers=min(len(table_list), 8)) as pool:
+            futures = {pool.submit(_check, t): t for t in table_list}
+            for fut in as_completed(futures):
+                s = fut.result()
+                results_map[s.table] = s
+
+        return [results_map[t] for t in table_list]
 
     def test_connection(self) -> Dict[str, str]:
         sql = "SELECT CURRENT_USER(), CURRENT_ROLE(), CURRENT_DATABASE(), CURRENT_SCHEMA()"
