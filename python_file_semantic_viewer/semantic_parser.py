@@ -315,8 +315,23 @@ def _parse_from_model(model, diags: List[str]) -> SemanticGraph:
 
 
 def _exec_and_find_model(namespace: Dict[str, object], text: str, diags: List[str]):
-    """Exec compiled source into namespace and return the first Model found."""
-    exec(compile(text, "<semantic_model>", "exec"), namespace)  # noqa: S102
+    """
+    Exec compiled source into namespace and return the first Model found.
+
+    If exec raises (e.g. RAI validation errors from code that runs after the
+    model definition), we still check the namespace — the model object is
+    typically fully constructed before any such error occurs.
+    """
+    exec_error: Optional[Exception] = None
+    try:
+        exec(compile(text, "<semantic_model>", "exec"), namespace)  # noqa: S102
+    except Exception as exc:
+        exec_error = exc
+        diags.append(
+            f"[EXEC] exec raised {type(exc).__name__}: {exc} — "
+            "checking namespace for model anyway…"
+        )
+
     candidates = [
         (k, v) for k, v in namespace.items()
         if hasattr(v, "to_metamodel") and hasattr(v, "defines") and hasattr(v, "concepts")
@@ -325,6 +340,8 @@ def _exec_and_find_model(namespace: Dict[str, object], text: str, diags: List[st
     if not candidates:
         all_names = [k for k in namespace if not k.startswith("__")]
         diags.append(f"[EXEC] All namespace names: {all_names}")
+        if exec_error:
+            raise exec_error
         raise ValueError(
             "No Model object found. Ensure the file creates a relationalai.semantics.Model instance."
         )
