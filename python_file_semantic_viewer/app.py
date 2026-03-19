@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -72,7 +72,7 @@ def _relationalai_available() -> bool:
 
 
 @st.cache_data(show_spinner=False)
-def _load_graph(text: str) -> SemanticGraph:
+def _load_graph(text: str) -> Tuple[SemanticGraph, List[str]]:
     return parse_semantic_text(text)
 
 
@@ -133,7 +133,7 @@ with st.sidebar:
         st.stop()
 
     try:
-        graph = _load_graph(uploaded_file.getvalue().decode("utf-8", errors="ignore"))
+        graph, parse_diags = _load_graph(uploaded_file.getvalue().decode("utf-8", errors="ignore"))
         ca.metric("Concepts", len(graph.concepts))
         cb.metric("Relationships", len(graph.relationships))
     except Exception as exc:
@@ -166,6 +166,9 @@ with st.sidebar:
                 st.caption(f"· `{t}`")
         else:
             st.caption("none")
+        st.divider()
+        st.markdown("**Full parser log**")
+        st.code("\n".join(parse_diags), language=None)
 
     st.divider()
     st.subheader("Snowflake")

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import re
+import traceback
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
-# ── Data structures (unchanged — consumed by app.py, graph_counts.py, graph_filter.py) ──
+# ── Data structures ───────────────────────────────────────────────────────────
 
 @dataclass
 class ConceptInfo:
@@ -31,7 +32,7 @@ class SemanticGraph:
     tables: List[str]
 
 
-# ── Shared helpers ────────────────────────────────────────────────────────────
+# ── Shared helpers ─────────────────────────────────────────────────────────────
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -89,7 +90,7 @@ def _collect_block_updates(define_block):
             yield from _walk(body)
 
 
-def _parse_from_model(model) -> SemanticGraph:
+def _parse_from_model(model, diags: List[str]) -> SemanticGraph:
     """
     Extract a SemanticGraph from a live PyRel Model object using the
     metamodel IR (model.to_metamodel()) rather than text parsing.
@@ -105,9 +106,11 @@ def _parse_from_model(model) -> SemanticGraph:
     entity_names: set[str] = set()
     value_names: set[str] = set()
     primitive_names: set[str] = set()
+    table_names: set[str] = set()
 
     for t in mm.types:
         if isinstance(t, Table):
+            table_names.add(t.name)
             continue
         if is_entity_type(t):
             entity_names.add(t.name)
@@ -116,28 +119,43 @@ def _parse_from_model(model) -> SemanticGraph:
         elif is_primitive(t):
             primitive_names.add(t.name)
 
-    # ── 2. Walk define blocks for data-source mappings ────────────────────────
-    # For each concept: base_table and id_columns
-    # For each semantic relation: rel_table and the column names used in joins
-    concept_table_map: Dict[str, str] = {}       # entity_name → Snowflake table
-    concept_id_cols: Dict[str, List[str]] = {}   # entity_name → [id_col_key, ...]
-    rel_table_map: Dict[str, str] = {}           # rel_name → Snowflake table
-    rel_table_cols_map: Dict[str, List[str]] = {}  # rel_name → [col, ...]
+    diags.append(
+        f"[MM] Types — total: {len(mm.types)}  "
+        f"entity: {len(entity_names)}  value: {len(value_names)}  "
+        f"primitive: {len(primitive_names)}  table: {len(table_names)}"
+    )
+    diags.append(f"[MM] Entity types: {sorted(entity_names) or '(none)'}")
+    diags.append(f"[MM] Snowflake tables in IR: {sorted(table_names) or '(none)'}")
+    diags.append(f"[MM] Relations in IR: {len(mm.relations)}")
+    diags.append(f"[MM] Define blocks: {len(model.defines)}")
 
-    # Also collect concrete type resolution from define block Update nodes
+    # ── 2. Walk define blocks for data-source mappings ────────────────────────
+    concept_table_map: Dict[str, str] = {}
+    concept_id_cols: Dict[str, List[str]] = {}
+    rel_table_map: Dict[str, str] = {}
+    rel_table_cols_map: Dict[str, List[str]] = {}
     concrete_types: Dict[Tuple, str] = {}
 
-    for d in model.defines:
-        block_updates = list(_collect_block_updates(d))
+    for d_idx, d in enumerate(model.defines):
+        try:
+            block_updates = list(_collect_block_updates(d))
+        except Exception as exc:
+            diags.append(f"[MM] Define block {d_idx}: ERROR collecting updates — {exc}")
+            continue
+
+        diags.append(f"[MM] Define block {d_idx}: {len(block_updates)} Update nodes")
 
         for upd in block_updates:
-            # Concrete type resolution (for abstract/polymorphic fields)
-            types = [a.type.name for a in upd.args]
+            try:
+                types = [a.type.name for a in upd.args]
+            except Exception as exc:
+                diags.append(f"  upd '{getattr(upd.relation, 'name', '?')}': arg type error — {exc}")
+                continue
+
             ent_ctx = next((t for t in types if t in entity_names), "")
             for i, t in enumerate(types):
                 concrete_types.setdefault((upd.relation.name, ent_ctx, i), t)
 
-            # Partition args by whether they're entity-typed or Table-typed
             entity_args = [
                 a for a in upd.args
                 if hasattr(a, "type") and is_entity_type(a.type)
@@ -151,50 +169,71 @@ def _parse_from_model(model) -> SemanticGraph:
                 continue
 
             table_name = table_args[0].type.name
-            # Column names live on arg.name for Table-typed args
             col_names = [c for c in (getattr(a, "name", None) for a in table_args) if c]
-
             rel_name = upd.relation.name
+
             if rel_name in _BUILTIN_NAMES or "_row_id_" in rel_name:
                 continue
 
             if len(entity_args) == 1 and entity_args[0].type.name in entity_names:
-                # Identity define (Concept.new): maps one entity to a source table
                 concept = entity_args[0].type.name
+                first_time = concept not in concept_table_map
                 concept_table_map.setdefault(concept, table_name)
-                # The relation name is the keyword used in new() — i.e. the id column key
                 existing = concept_id_cols.setdefault(concept, [])
                 if rel_name and not rel_name.startswith("_") and rel_name not in existing:
                     existing.append(rel_name)
+                if first_time:
+                    diags.append(
+                        f"  concept '{concept}' → table '{table_name}'  "
+                        f"id_key='{rel_name}'"
+                    )
 
             elif len(entity_args) >= 2:
-                # Relationship define: maps a semantic relation through a table
                 rel_table_map.setdefault(rel_name, table_name)
                 existing_cols = rel_table_cols_map.setdefault(rel_name, [])
                 for c in col_names:
                     if c not in existing_cols:
                         existing_cols.append(c)
+                diags.append(
+                    f"  rel-table '{rel_name}' → '{table_name}'  cols={col_names}"
+                )
+
+    diags.append(
+        f"[MM] Concepts with table binding: "
+        f"{sorted(concept_table_map.keys()) or '(none)'}"
+    )
+    diags.append(
+        f"[MM] Concepts without table binding: "
+        f"{sorted(entity_names - concept_table_map.keys()) or '(none)'}"
+    )
 
     # ── 3. Build relationships from user semantic relations ────────────────────
-    def _is_user_relation(rel) -> bool:
-        if rel.name in _BUILTIN_NAMES or not rel.fields:
-            return False
+    def _is_user_relation(rel) -> Tuple[bool, str]:
+        if rel.name in _BUILTIN_NAMES:
+            return False, "builtin name"
+        if not rel.fields:
+            return False, "no fields"
         if "_row_id_" in rel.name:
-            return False
-        return not any(isinstance(f.type, Table) for f in rel.fields)
+            return False, "row_id relation"
+        if any(isinstance(f.type, Table) for f in rel.fields):
+            return False, "has Table-typed field"
+        return True, ""
 
     known_names = entity_names | value_names | primitive_names
     relationships: List[RelationshipInfo] = []
+    skipped_counts: Dict[str, int] = {}
 
     for rel in mm.relations:
-        if not _is_user_relation(rel):
+        is_user, skip_reason = _is_user_relation(rel)
+        if not is_user:
+            skipped_counts[skip_reason] = skipped_counts.get(skip_reason, 0) + 1
             continue
 
-        # Resolve each field's concrete type (handle abstract/primitive)
         ent_ctx = next(
             (f.type.name for f in rel.fields if is_entity_type(f.type)), ""
         )
         roles: List[str] = []
+        skip_msg: Optional[str] = None
         try:
             for i, f in enumerate(rel.fields):
                 type_name = f.type.name
@@ -203,13 +242,30 @@ def _parse_from_model(model) -> SemanticGraph:
                     if is_abstract(f.type) and type_name == f.type.name:
                         raise ValueError("unresolved abstract type")
                 roles.append(type_name)
-        except ValueError:
+        except ValueError as exc:
+            skip_msg = str(exc)
+
+        if skip_msg:
+            diags.append(f"[MM] Relation '{rel.name}' SKIPPED — {skip_msg}  roles={roles}")
+            skipped_counts["unresolved abstract"] = skipped_counts.get("unresolved abstract", 0) + 1
             continue
 
         if not any(r in known_names for r in roles):
+            diags.append(f"[MM] Relation '{rel.name}' SKIPPED — no known type in roles {roles}")
+            skipped_counts["no known type"] = skipped_counts.get("no known type", 0) + 1
             continue
 
-        # Build the human-readable reading label from the relation's reading
+        entity_role_names = [r for r in roles if r in entity_names]
+        if len(entity_role_names) < 2:
+            diags.append(
+                f"[MM] Relation '{rel.name}' SKIPPED — only {len(entity_role_names)} "
+                f"entity role(s) {entity_role_names} (attribute, not edge)"
+            )
+            skipped_counts["attribute (< 2 entity roles)"] = (
+                skipped_counts.get("attribute (< 2 entity roles)", 0) + 1
+            )
+            continue
+
         label = rel.name
         if rel.readings:
             parts = rel.readings[0].parts
@@ -218,18 +274,18 @@ def _parse_from_model(model) -> SemanticGraph:
                 for p in parts
             ).strip()
 
-        # Only emit edges for entity-to-entity relationships (not attribute bundles)
-        entity_role_names = [r for r in roles if r in entity_names]
-        if len(entity_role_names) < 2:
-            continue
-
         source = entity_role_names[0]
         target = entity_role_names[1]
-
         rel_table = rel_table_map.get(rel.name)
         table_cols = rel_table_cols_map.get(rel.name, [])
         source_join = _match_columns(concept_id_cols.get(source, []), table_cols)
         target_join = _match_columns(concept_id_cols.get(target, []), table_cols)
+
+        diags.append(
+            f"[MM] Relation '{rel.name}' → EDGE  label='{label}'  "
+            f"{source} → {target}  rel_table={rel_table}  "
+            f"src_join={source_join}  tgt_join={target_join}"
+        )
 
         relationships.append(RelationshipInfo(
             name=label,
@@ -239,6 +295,9 @@ def _parse_from_model(model) -> SemanticGraph:
             source_join=source_join,
             target_join=target_join,
         ))
+
+    diags.append(f"[MM] Relations skipped breakdown: {skipped_counts}")
+    diags.append(f"[MM] Edges emitted: {len(relationships)}")
 
     # ── 4. Assemble SemanticGraph ──────────────────────────────────────────────
     concepts: Dict[str, ConceptInfo] = {
@@ -254,21 +313,28 @@ def _parse_from_model(model) -> SemanticGraph:
     return SemanticGraph(concepts=concepts, relationships=relationships, tables=tables)
 
 
-def _exec_model(text: str):
+def _exec_model(text: str, diags: List[str]):
     """Execute PyRel model source and return the Model instance."""
+    diags.append("[EXEC] Compiling source…")
     namespace: Dict[str, object] = {}
     exec(compile(text, "<semantic_model>", "exec"), namespace)  # noqa: S102
-    for val in namespace.values():
-        if hasattr(val, "to_metamodel") and hasattr(val, "defines") and hasattr(val, "concepts"):
-            return val
-    raise ValueError(
-        "No Model object found. Ensure the file creates a relationalai.semantics.Model instance."
-    )
+    candidates = [
+        (k, v) for k, v in namespace.items()
+        if hasattr(v, "to_metamodel") and hasattr(v, "defines") and hasattr(v, "concepts")
+    ]
+    diags.append(f"[EXEC] Model candidates in namespace: {[k for k, _ in candidates]}")
+    if not candidates:
+        all_names = [k for k in namespace if not k.startswith("__")]
+        diags.append(f"[EXEC] All namespace names: {all_names}")
+        raise ValueError(
+            "No Model object found. Ensure the file creates a relationalai.semantics.Model instance."
+        )
+    name, val = candidates[0]
+    diags.append(f"[EXEC] Using model: '{name}'  type={type(val).__name__}")
+    return val
 
 
 # ── Regex fallback parser ─────────────────────────────────────────────────────
-# Used when exec fails (e.g. syntax errors from space-containing keyword names,
-# or when relationalai is not installed in the current environment).
 
 def _extract_sources_refs(text: str) -> List[str]:
     refs: List[str] = []
@@ -312,15 +378,10 @@ def _parse_column_ref(ref: str, table_map: Optional[Dict[str, str]] = None) -> O
     column = parts[-1]
     if not _is_valid_identifier(column):
         return None
-    # Walk right-to-left through the chain to find a part that's a known table
-    # var. This handles deeply nested Sources classes like:
-    #   Sources.team.schema.rma_analysis.column_name
-    # where the table var (rma_analysis) could be at any depth.
     if table_map:
         for i in range(len(parts) - 2, 0, -1):
             if parts[i] in table_map:
                 return parts[i], column
-    # Fallback: assume second-to-last part is the table var
     return parts[-2], column
 
 
@@ -337,7 +398,7 @@ def _extract_define_bodies(text: str) -> List[str]:
         start = text.find(marker, search_from)
         if start == -1:
             break
-        i = start + len(marker) - 1  # position of opening '('
+        i = start + len(marker) - 1
         depth = 0
         body_start = i + 1
         while i < len(text):
@@ -347,7 +408,6 @@ def _extract_define_bodies(text: str) -> List[str]:
                 depth -= 1
                 if depth == 0:
                     raw = text[body_start:i]
-                    # Collapse whitespace (newlines, indent) into single spaces
                     bodies.append(re.sub(r"\s+", " ", raw).strip())
                     break
             i += 1
@@ -355,22 +415,21 @@ def _extract_define_bodies(text: str) -> List[str]:
     return bodies
 
 
-def _parse_semantic_text_regex(text: str) -> SemanticGraph:
+def _parse_semantic_text_regex(text: str, diags: List[str]) -> SemanticGraph:
     """Regex-based parser — fallback when exec of the model code is not possible."""
+    diags.append("[REGEX] Using regex fallback parser")
     table_map: Dict[str, str] = {}
     concepts: Dict[str, ConceptInfo] = {}
     relationships: List[RelationshipInfo] = []
 
-    # Scan the full source text for model.Table(...) assignments.
-    # Handles multi-line calls and indented definitions inside nested classes.
     _table_full_re = re.compile(
         r"^\s*(\w+)\s*=\s*model\.Table\(\s*[\"']([^\"']+)[\"']\s*\)",
         re.MULTILINE,
     )
     for m in _table_full_re.finditer(text):
         table_map[m.group(1)] = m.group(2)
+    diags.append(f"[REGEX] Tables found: {table_map or '(none)'}")
 
-    # Concepts — still reliably single-line at module level
     concept_re = re.compile(r"^(?P<concept>\w+)\s*=\s*model\.Concept\(\"(?P<label>[^\"]+)\"")
     for line in text.splitlines():
         line = line.strip()
@@ -379,14 +438,16 @@ def _parse_semantic_text_regex(text: str) -> SemanticGraph:
         m = concept_re.match(line)
         if m:
             concepts[m.group("concept")] = ConceptInfo(name=m.group("concept"))
+    diags.append(f"[REGEX] Concepts found: {list(concepts.keys()) or '(none)'}")
 
-    # Extract all model.define(...) bodies as normalised single-line strings,
-    # then apply the same patterns as before against each body.
+    define_bodies = _extract_define_bodies(text)
+    diags.append(f"[REGEX] model.define() bodies extracted: {len(define_bodies)}")
+    for i, body in enumerate(define_bodies):
+        diags.append(f"  body[{i}]: {body[:120]}{'…' if len(body) > 120 else ''}")
+
     define_new_re = re.compile(r"^(?P<concept>\w+)\.new\((?P<args>.+)\)\s*$")
-    define_rel_re = re.compile(r"^(?P<body>.+)$")
 
-    for body in _extract_define_bodies(text):
-        # ── Concept identity define: Concept.new(id=Sources...) ──────────
+    for body in define_bodies:
         m = define_new_re.match(body)
         if m:
             concept_name = m.group("concept")
@@ -411,20 +472,24 @@ def _parse_semantic_text_regex(text: str) -> SemanticGraph:
             if concept_name in concepts:
                 concepts[concept_name].id_columns = id_cols
                 concepts[concept_name].base_table = base_table
+                diags.append(
+                    f"[REGEX] Concept.new '{concept_name}' → table='{base_table}'  "
+                    f"id_cols={id_cols}"
+                )
+            else:
+                diags.append(
+                    f"[REGEX] Concept.new '{concept_name}' not in known concepts — SKIPPED"
+                )
             continue
 
-        # ── Relationship define: Src.filter_by(...).rel(Tgt.filter_by(...)) ─
         src_match = re.match(r"^(?P<src>\w+)\.filter_by", body)
         if not src_match:
-            continue
-        source = src_match.group("src")
-        body = body  # use collapsed body for all further matching
-        src_match = re.match(r"^(?P<src>\w+)\.filter_by", body)
-        if not src_match:
+            diags.append(f"[REGEX] Body not matched (no .new or .filter_by): {body[:80]}")
             continue
         source = src_match.group("src")
         rel_match = re.search(r"\)\.(?P<rel>\w+)\((?P<args>.*)\)\s*$", body)
         if not rel_match:
+            diags.append(f"[REGEX] Rel body: no trailing .rel(...) pattern — {body[:80]}")
             continue
         rel_name = rel_match.group("rel")
         args_str = rel_match.group("args")
@@ -452,6 +517,11 @@ def _parse_semantic_text_regex(text: str) -> SemanticGraph:
                 if table_map.get(table_var) == rel_table:
                     rel_table_cols.append(col)
 
+        diags.append(
+            f"[REGEX] Rel '{rel_name}'  {source} → {target_concepts}  "
+            f"rel_table={rel_table}  cols={rel_table_cols}"
+        )
+
         for target in target_concepts:
             if target == source:
                 continue
@@ -476,25 +546,56 @@ def _parse_semantic_text_regex(text: str) -> SemanticGraph:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def parse_semantic_text(text: str) -> SemanticGraph:
+def parse_semantic_text(text: str) -> Tuple[SemanticGraph, List[str]]:
     """
     Parse a PyRel semantic layer Python file.
+
+    Returns (SemanticGraph, diagnostics) where diagnostics is a list of
+    strings describing what the parser found at each step.
 
     Primary path: exec the file to get the live Model object, then introspect
     it via model.to_metamodel() for accurate, structure-aware extraction.
 
-    Fallback: regex text parsing for files with non-standard syntax (e.g.
-    space-containing keyword names in filter_by calls) or environments where
-    relationalai is not installed.
+    Fallback: regex text parsing for files with non-standard syntax or
+    environments where relationalai is not installed.
     """
+    diags: List[str] = []
     try:
-        model = _exec_model(text)
-        return _parse_from_model(model)
-    except Exception:
-        return _parse_semantic_text_regex(text)
+        diags.append("[EXEC] Attempting metamodel path…")
+        model = _exec_model(text, diags)
+        diags.append("[MM] Running _parse_from_model…")
+        graph = _parse_from_model(model, diags)
+        diags.append(
+            f"[DONE] Metamodel parse complete — "
+            f"{len(graph.concepts)} concepts, {len(graph.relationships)} relationships, "
+            f"{len(graph.tables)} tables"
+        )
+        return graph, diags
+    except Exception as exc:
+        diags.append(f"[EXEC] FAILED — {type(exc).__name__}: {exc}")
+        diags.append("[EXEC] Traceback:")
+        for line in traceback.format_exc().splitlines():
+            diags.append(f"  {line}")
+        diags.append("[EXEC] Falling back to regex parser…")
+
+    try:
+        graph = _parse_semantic_text_regex(text, diags)
+        diags.append(
+            f"[DONE] Regex parse complete — "
+            f"{len(graph.concepts)} concepts, {len(graph.relationships)} relationships, "
+            f"{len(graph.tables)} tables"
+        )
+        return graph, diags
+    except Exception as exc:
+        diags.append(f"[REGEX] FAILED — {type(exc).__name__}: {exc}")
+        diags.append("[REGEX] Traceback:")
+        for line in traceback.format_exc().splitlines():
+            diags.append(f"  {line}")
+        empty = SemanticGraph(concepts={}, relationships=[], tables=[])
+        return empty, diags
 
 
-def parse_semantic_file(path: str) -> SemanticGraph:
+def parse_semantic_file(path: str) -> Tuple[SemanticGraph, List[str]]:
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
     return parse_semantic_text(text)
