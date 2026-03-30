@@ -35,7 +35,7 @@ WITH surcharge_rates AS (
         ('RELATIONAL_AI_HIGHMEM_X64_S',        0.28,   6),
         ('RELATIONAL_AI_HIGHMEM_X64_M_SOLVER', 1.11,  28),
         ('RELATIONAL_AI_HIGHMEM_X64_S_SOLVER', 0.28,   6),
-        ('RELATIONAL_AI_GPU_NV_S_ML',          0.11,  18),
+        ('RELATIONAL_AI_GPU_NV_S_ML',          0.57,  18),
         ('RELATIONAL_AI_HIGHMEM_X64_S_ML',     0.28,   6)
     ) AS t(pool_name_prefix, credits_per_hour, surcharge_per_hour)
 ),
