@@ -33,6 +33,7 @@ WITH surcharge_rates AS (
         ('RELATIONAL_AI_HIGHMEM_X64_L',        4.44, 124),
         ('RELATIONAL_AI_HIGHMEM_X64_M',        1.11,  28),
         ('RELATIONAL_AI_HIGHMEM_X64_S',        0.28,   6),
+        ('RELATIONAL_AI_HIGHMEM_X64_SL',       2.93,  92),
         ('RELATIONAL_AI_HIGHMEM_X64_M_SOLVER', 1.11,  28),
         ('RELATIONAL_AI_HIGHMEM_X64_S_SOLVER', 0.28,   6),
         ('RELATIONAL_AI_GPU_NV_S_ML',          0.57,  18),
