@@ -318,13 +318,16 @@ def _q(template: str, **kwargs) -> str:
     return template.format(db=RAI_DB, **kwargs)
 
 
-@st.cache_data(ttl=120, show_spinner=False)
 def fetch(sql: str) -> pd.DataFrame:
-    try:
-        return run_query(sql)
-    except Exception as exc:
-        st.warning(f"Query error: {exc}")
-        return pd.DataFrame()
+    """Fetch query results, caching in session state until the user clicks Refresh."""
+    cache: dict = st.session_state.setdefault("_query_cache", {})
+    if sql not in cache:
+        try:
+            cache[sql] = run_query(sql)
+        except Exception as exc:
+            st.warning(f"Query error: {exc}")
+            cache[sql] = pd.DataFrame()
+    return cache[sql]
 
 
 def _pct(val) -> str:
@@ -442,7 +445,7 @@ with st.sidebar:
     st.divider()
 
     if st.button("Refresh data", width="stretch"):
-        st.cache_data.clear()
+        st.session_state.pop("_query_cache", None)
         st.rerun()
 
     st.caption(f"RelationalAI app DB: `{RAI_DB}`")
@@ -458,87 +461,57 @@ st.caption(
     "Data sourced from `RELATIONALAI.OBSERVABILITY_PREVIEW` and Snowflake Account Usage."
 )
 
-tab_overview, tab_memory, tab_cpu, tab_demand, tab_credits = st.tabs([
-    "Overview", "Memory", "CPU", "Demand", "Credits",
-])
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB: OVERVIEW
-# ══════════════════════════════════════════════════════════════════════════════
-
-with tab_overview:
+@st.fragment
+def _tab_overview(selected: list[str]) -> None:
     LOOKBACK_HOURS, LOOKBACK_DAYS, DATE_FROM, DATE_TO = _time_controls("overview", default_index=0)
     st.subheader(f"Snapshot — {DATE_FROM} → {DATE_TO}")
 
     col_mem, col_cpu, col_demand, col_cred = st.columns(4)
-
-    df_mem_ov  = _filter(fetch(_q(_Q_MEMORY_HOURLY, lookback_hours=LOOKBACK_HOURS)), SELECTED)
-    df_cpu_ov  = _filter(fetch(_q(_Q_CPU_HOURLY,    lookback_hours=LOOKBACK_HOURS)), SELECTED)
-    df_dem_ov  = _filter(fetch(_q(_Q_DEMAND_HOURLY, lookback_hours=LOOKBACK_HOURS)), SELECTED)
+    df_mem_ov  = _filter(fetch(_q(_Q_MEMORY_HOURLY, lookback_hours=LOOKBACK_HOURS)), selected)
+    df_cpu_ov  = _filter(fetch(_q(_Q_CPU_HOURLY,    lookback_hours=LOOKBACK_HOURS)), selected)
+    df_dem_ov  = _filter(fetch(_q(_Q_DEMAND_HOURLY, lookback_hours=LOOKBACK_HOURS)), selected)
     df_cred_ov = _apply_pool_mapping(fetch(_q(_Q_CREDITS_TOTAL, date_from=DATE_FROM, date_to=DATE_TO)))
 
     with col_mem:
-        if not df_mem_ov.empty and "AVG_MEMORY" in df_mem_ov.columns:
-            st.metric("Avg Memory Util", _pct(df_mem_ov["AVG_MEMORY"].mean()))
-        else:
-            st.metric("Avg Memory Util", "No data")
-
+        st.metric("Avg Memory Util", _pct(df_mem_ov["AVG_MEMORY"].mean()) if not df_mem_ov.empty and "AVG_MEMORY" in df_mem_ov.columns else "No data")
     with col_cpu:
-        if not df_cpu_ov.empty and "AVG_CPU" in df_cpu_ov.columns:
-            st.metric("Avg CPU Util", _pct(df_cpu_ov["AVG_CPU"].mean()))
-        else:
-            st.metric("Avg CPU Util", "No data")
-
+        st.metric("Avg CPU Util", _pct(df_cpu_ov["AVG_CPU"].mean()) if not df_cpu_ov.empty and "AVG_CPU" in df_cpu_ov.columns else "No data")
     with col_demand:
         if not df_dem_ov.empty and "MAX_DEMAND" in df_dem_ov.columns:
             peak = df_dem_ov["MAX_DEMAND"].max()
             st.metric("Peak Demand", f"{_demand_icon(peak)} {peak:.3f}")
         else:
             st.metric("Peak Demand", "No data")
-
     with col_cred:
-        if not df_cred_ov.empty and "CREDITS_USED" in df_cred_ov.columns:
-            st.metric("Total Credits Used", f"{df_cred_ov['CREDITS_USED'].sum():,.2f}")
-        else:
-            st.metric("Total Credits Used", "No data")
+        st.metric("Total Credits Used", f"{df_cred_ov['CREDITS_USED'].sum():,.2f}" if not df_cred_ov.empty and "CREDITS_USED" in df_cred_ov.columns else "No data")
 
     st.divider()
     st.subheader("Active Reasoners Over Time")
-
     df_active = fetch(_q(_Q_ACTIVE_REASONERS, lookback_hours=LOOKBACK_HOURS))
     if df_active.empty:
         st.info("No data available. Ensure the observability view is registered.")
     else:
-        fig = px.bar(
-            df_active, x="HOUR", y="ACTIVE_REASONERS",
-            labels={"ACTIVE_REASONERS": "Active Reasoners", "HOUR": "Time"},
-            title=f"Active Reasoners — {time_window}",
-        )
+        fig = px.bar(df_active, x="HOUR", y="ACTIVE_REASONERS",
+                     labels={"ACTIVE_REASONERS": "Active Reasoners", "HOUR": "Time"},
+                     title=f"Active Reasoners — {DATE_FROM} → {DATE_TO}")
         fig.update_yaxes(dtick=1)
         st.plotly_chart(fig, width="stretch")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB: MEMORY
-# ══════════════════════════════════════════════════════════════════════════════
-
-with tab_memory:
+@st.fragment
+def _tab_memory(selected: list[str]) -> None:
     st.subheader("Memory Utilization")
     LOOKBACK_HOURS, LOOKBACK_DAYS, _, _ = _time_controls("memory", default_index=0)
     sub_rt, sub_hourly, sub_daily = st.tabs(["Real-Time (5 min)", "Hourly", "Daily Trend"])
 
     with sub_rt:
-        df = _filter(fetch(_q(_Q_MEMORY_REALTIME)), SELECTED)
+        df = _filter(fetch(_q(_Q_MEMORY_REALTIME)), selected)
         if df.empty:
             st.info("No data in the last 5 minutes.")
         else:
-            fig = px.line(
-                df, x="TIMESTAMP", y="MEMORY_UTILIZATION", color="REASONER_NAME",
-                labels={"MEMORY_UTILIZATION": "Memory Utilization", "TIMESTAMP": "Time"},
-                title="Memory Utilization — Last 5 Minutes",
-                render_mode="svg",
-            )
+            fig = px.line(df, x="TIMESTAMP", y="MEMORY_UTILIZATION", color="REASONER_NAME",
+                          labels={"MEMORY_UTILIZATION": "Memory Utilization", "TIMESTAMP": "Time"},
+                          title="Memory Utilization — Last 5 Minutes", render_mode="svg")
             fig.add_hline(y=0.8, line_dash="dash", line_color="red", annotation_text="80% threshold")
             fig.update_yaxes(tickformat=".0%", range=[0, 1])
             fig.update_xaxes(range=[df["TIMESTAMP"].max() - pd.Timedelta(minutes=5), df["TIMESTAMP"].max()])
@@ -546,7 +519,7 @@ with tab_memory:
             st.dataframe(df, width="stretch")
 
     with sub_hourly:
-        df = _filter(fetch(_q(_Q_MEMORY_HOURLY, lookback_hours=LOOKBACK_HOURS)), SELECTED)
+        df = _filter(fetch(_q(_Q_MEMORY_HOURLY, lookback_hours=LOOKBACK_HOURS)), selected)
         if df.empty:
             st.info("No hourly data available.")
         else:
@@ -560,7 +533,7 @@ with tab_memory:
             st.dataframe(df, width="stretch")
 
     with sub_daily:
-        df = _filter(fetch(_q(_Q_MEMORY_DAILY, lookback_days=LOOKBACK_DAYS)), SELECTED)
+        df = _filter(fetch(_q(_Q_MEMORY_DAILY, lookback_days=LOOKBACK_DAYS)), selected)
         if df.empty:
             st.info("No daily data available.")
         else:
@@ -573,24 +546,20 @@ with tab_memory:
             st.dataframe(df, width="stretch")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB: CPU
-# ══════════════════════════════════════════════════════════════════════════════
-
-with tab_cpu:
+@st.fragment
+def _tab_cpu(selected: list[str]) -> None:
     st.subheader("CPU Utilization")
     LOOKBACK_HOURS, _, _, _ = _time_controls("cpu", default_index=0)
     sub_rt, sub_hourly = st.tabs(["Real-Time (5 min)", "Hourly"])
 
     with sub_rt:
-        df = _filter(fetch(_q(_Q_CPU_REALTIME)), SELECTED)
+        df = _filter(fetch(_q(_Q_CPU_REALTIME)), selected)
         if df.empty:
             st.info("No data in the last 5 minutes.")
         else:
             fig = px.line(df, x="TIMESTAMP", y="CPU_UTILIZATION", color="REASONER_NAME",
                           labels={"CPU_UTILIZATION": "CPU Utilization", "TIMESTAMP": "Time"},
-                          title="CPU Utilization — Last 5 Minutes",
-                          render_mode="svg")
+                          title="CPU Utilization — Last 5 Minutes", render_mode="svg")
             fig.add_hline(y=0.95, line_dash="dash", line_color="red", annotation_text="95% critical")
             fig.add_hline(y=0.85, line_dash="dot", line_color="orange", annotation_text="85% warning")
             fig.update_yaxes(tickformat=".0%", range=[0, 1])
@@ -599,7 +568,7 @@ with tab_cpu:
             st.dataframe(df, width="stretch")
 
     with sub_hourly:
-        df = _filter(fetch(_q(_Q_CPU_HOURLY, lookback_hours=LOOKBACK_HOURS)), SELECTED)
+        df = _filter(fetch(_q(_Q_CPU_HOURLY, lookback_hours=LOOKBACK_HOURS)), selected)
         if df.empty:
             st.info("No hourly data available.")
         else:
@@ -613,37 +582,31 @@ with tab_cpu:
             st.dataframe(df, width="stretch")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB: DEMAND
-# ══════════════════════════════════════════════════════════════════════════════
-
-with tab_demand:
+@st.fragment
+def _tab_demand(selected: list[str]) -> None:
     st.subheader("Reasoner Demand")
     st.caption("Demand > 1.0 indicates jobs are queuing beyond available capacity.")
     LOOKBACK_HOURS, LOOKBACK_DAYS, _, _ = _time_controls("demand", default_index=0)
     sub_rt, sub_hourly, sub_daily = st.tabs(["Real-Time (5 min)", "Hourly", "Daily Trend"])
 
     with sub_rt:
-        df = _filter(fetch(_q(_Q_DEMAND_REALTIME)), SELECTED)
+        df = _filter(fetch(_q(_Q_DEMAND_REALTIME)), selected)
         if df.empty:
             st.info("No demand data in the last 5 minutes.")
         else:
             fig = px.line(df, x="TIMESTAMP", y="DEMAND", color="REASONER_NAME",
                           labels={"DEMAND": "Demand", "TIMESTAMP": "Time"},
-                          title="Reasoner Demand — Last 5 Minutes",
-                          render_mode="svg")
+                          title="Reasoner Demand — Last 5 Minutes", render_mode="svg")
             fig.add_hline(y=1.0, line_dash="dash", line_color="red", annotation_text="Queuing threshold")
             fig.add_hline(y=0.8, line_dash="dot", line_color="orange", annotation_text="80% warning")
             fig.update_xaxes(range=[df["TIMESTAMP"].max() - pd.Timedelta(minutes=5), df["TIMESTAMP"].max()])
             st.plotly_chart(fig, width="stretch")
             latest = df.sort_values("TIMESTAMP", ascending=False).drop_duplicates("REASONER_NAME").copy()
-            latest["Status"] = latest["DEMAND"].apply(
-                lambda v: "Queuing" if v > 1.0 else ("High" if v > 0.8 else "OK")
-            )
+            latest["Status"] = latest["DEMAND"].apply(lambda v: "Queuing" if v > 1.0 else ("High" if v > 0.8 else "OK"))
             st.dataframe(latest[["REASONER_NAME", "REASONER_CAPACITY", "DEMAND", "Status", "TIMESTAMP"]], width="stretch")
 
     with sub_hourly:
-        df = _filter(fetch(_q(_Q_DEMAND_HOURLY, lookback_hours=LOOKBACK_HOURS)), SELECTED)
+        df = _filter(fetch(_q(_Q_DEMAND_HOURLY, lookback_hours=LOOKBACK_HOURS)), selected)
         if df.empty:
             st.info("No hourly demand data available.")
         else:
@@ -657,7 +620,7 @@ with tab_demand:
             st.dataframe(df, width="stretch")
 
     with sub_daily:
-        df = _filter(fetch(_q(_Q_DEMAND_DAILY, lookback_days=LOOKBACK_DAYS)), SELECTED)
+        df = _filter(fetch(_q(_Q_DEMAND_DAILY, lookback_days=LOOKBACK_DAYS)), selected)
         if df.empty:
             st.info("No daily demand data available.")
         else:
@@ -670,25 +633,20 @@ with tab_demand:
             st.dataframe(df, width="stretch")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB: CREDITS
-# ══════════════════════════════════════════════════════════════════════════════
-
-with tab_credits:
+@st.fragment
+def _tab_credits() -> None:
     st.subheader("Snowflake Credits — Compute Pools (RelationalAI)")
-    _, _, DATE_FROM, DATE_TO = _time_controls("credits", default_index=2)  # default: Last 30 days
+    _, _, DATE_FROM, DATE_TO = _time_controls("credits", default_index=2)
     st.caption(
         f"Source: `SNOWFLAKE.ACCOUNT_USAGE.SNOWPARK_CONTAINER_SERVICES_HISTORY` | "
         f"Date range: **{DATE_FROM}** → **{DATE_TO}**"
     )
-
     _df = {"date_from": str(DATE_FROM), "date_to": str(DATE_TO)}
 
     sub_pools, sub_cost, sub_breakdown, sub_marketplace = st.tabs([
         "By Compute Pool", "Cost Estimate", "Service Type Breakdown", "Marketplace Paid",
     ])
 
-    # ── Sub-tab: By Compute Pool (existing) ───────────────────────────────────
     with sub_pools:
         df_credits_total = _apply_pool_mapping(fetch(_q(_Q_CREDITS_TOTAL, **_df)))
         df_credits_daily = _apply_pool_mapping(fetch(_q(_Q_CREDITS_DAILY, **_df)))
@@ -701,14 +659,11 @@ with tab_credits:
             k2.metric("Compute Pools", df_credits_total["COMPUTE_POOL_NAME"].nunique())
             k3.metric("Highest Consumer",
                       df_credits_total.loc[df_credits_total["CREDITS_USED"].idxmax(), "COMPUTE_POOL_NAME"])
-
             st.divider()
-
             if not df_credits_daily.empty and "DAY" in df_credits_daily.columns:
                 _pool_order = _pool_category_order(df_credits_daily)
                 fig_trend = px.bar(df_credits_daily, x="DAY", y="CREDITS_USED", color="COMPUTE_POOL_NAME",
-                                   barmode="stack",
-                                   category_orders={"COMPUTE_POOL_NAME": _pool_order},
+                                   barmode="stack", category_orders={"COMPUTE_POOL_NAME": _pool_order},
                                    labels={"CREDITS_USED": "Credits Used", "DAY": "Date", "COMPUTE_POOL_NAME": "Compute Pool"},
                                    title="Daily Credit Consumption by Compute Pool")
                 daily_total = df_credits_daily.groupby("DAY")["CREDITS_USED"].sum().reset_index()
@@ -722,7 +677,6 @@ with tab_credits:
                     legend_title="Compute Pool",
                 )
                 st.plotly_chart(fig_trend, width="stretch")
-
             fig_bar = px.bar(df_credits_total, x="COMPUTE_POOL_NAME", y="CREDITS_USED",
                              labels={"CREDITS_USED": "Credits Used", "COMPUTE_POOL_NAME": "Compute Pool"},
                              title="Total Credits by Compute Pool",
@@ -730,7 +684,6 @@ with tab_credits:
             st.plotly_chart(fig_bar, width="stretch")
             st.dataframe(df_credits_total, width="stretch")
 
-    # ── Sub-tab: Cost Estimate ─────────────────────────────────────────────────
     with sub_cost:
         st.caption(
             "Uses standard list-price surcharge rates (Snowflake Service Consumption Table, Apr 2026). "
@@ -768,7 +721,6 @@ with tab_credits:
             except Exception as exc:
                 st.error(f"Failed: {exc}")
 
-    # ── Sub-tab: Service Type Breakdown ────────────────────────────────────────
     with sub_breakdown:
         st.caption(
             "Daily credits split across Warehouse Metering, Serverless Tasks, and "
@@ -784,13 +736,11 @@ with tab_credits:
                 df_melt = df_breakdown.melt(id_vars="USAGE_DATE", value_vars=available,
                                             var_name="Service Type", value_name="Credits")
                 fig_bd = px.bar(df_melt, x="USAGE_DATE", y="Credits", color="Service Type",
-                                barmode="stack",
-                                labels={"USAGE_DATE": "Date"},
+                                barmode="stack", labels={"USAGE_DATE": "Date"},
                                 title="Daily Credits by Service Type (RELATIONALAI)")
                 st.plotly_chart(fig_bd, width="stretch")
             st.dataframe(df_breakdown, width="stretch")
 
-    # ── Sub-tab: Marketplace Paid ──────────────────────────────────────────────
     with sub_marketplace:
         st.caption("Total RAI usage billed through the Snowflake Marketplace. Only populated on paid accounts.")
         df_mp = fetch(_Q_MARKETPLACE_PAID)
@@ -798,6 +748,26 @@ with tab_credits:
             st.info("No rows returned — this account may not have paid marketplace usage.")
         else:
             st.dataframe(df_mp, width="stretch")
+
+
+tab_overview, tab_memory, tab_cpu, tab_demand, tab_credits = st.tabs([
+    "Overview", "Memory", "CPU", "Demand", "Credits",
+])
+
+with tab_overview:
+    _tab_overview(SELECTED)
+
+with tab_memory:
+    _tab_memory(SELECTED)
+
+with tab_cpu:
+    _tab_cpu(SELECTED)
+
+with tab_demand:
+    _tab_demand(SELECTED)
+
+with tab_credits:
+    _tab_credits()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
