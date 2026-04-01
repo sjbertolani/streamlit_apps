@@ -382,6 +382,35 @@ def _apply_pool_mapping(df: pd.DataFrame) -> pd.DataFrame:
     return df.groupby(group_cols, as_index=False)["CREDITS_USED"].sum()
 
 
+def _time_controls(key_prefix: str, default_index: int = 0) -> tuple[int, int, dt.date, dt.date]:
+    """
+    Render an inline time-window selector and return
+    (lookback_hours, lookback_days, date_from, date_to).
+    """
+    _today = dt.date.today()
+    tw = st.selectbox(
+        "Time window",
+        ["Last 24 hours", "Last 7 days", "Last 30 days", "Custom dates"],
+        index=default_index,
+        key=f"{key_prefix}_tw",
+    )
+    if tw == "Custom dates":
+        c1, c2 = st.columns(2)
+        d_from = c1.date_input("From", value=_today - dt.timedelta(days=30),
+                               max_value=_today, key=f"{key_prefix}_from")
+        d_to   = c2.date_input("To",   value=_today, min_value=d_from,
+                               max_value=_today, key=f"{key_prefix}_to")
+        delta = (d_to - d_from).days + 1
+        return delta * 24, delta, d_from, d_to
+    _lk_map = {
+        "Last 24 hours": (24,  1),
+        "Last 7 days":   (168, 7),
+        "Last 30 days":  (720, 30),
+    }
+    lh, ld = _lk_map[tw]
+    return lh, ld, _today - dt.timedelta(days=ld - 1), _today
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
@@ -389,32 +418,6 @@ def _apply_pool_mapping(df: pd.DataFrame) -> pd.DataFrame:
 with st.sidebar:
     st.title("RelationalAI Observability")
     st.caption("RelationalAI Native App — resource monitoring")
-    st.divider()
-
-    # Time window
-    time_window = st.selectbox(
-        "Time window",
-        ["Last 24 hours", "Last 7 days", "Last 30 days", "Custom dates"],
-        index=0,
-    )
-    _today = dt.date.today()
-
-    if time_window == "Custom dates":
-        DATE_FROM: dt.date = st.date_input("From", value=_today - dt.timedelta(days=30), max_value=_today)
-        DATE_TO:   dt.date = st.date_input("To",   value=_today, min_value=DATE_FROM, max_value=_today)
-        _delta = (DATE_TO - DATE_FROM).days + 1
-        LOOKBACK_HOURS = _delta * 24
-        LOOKBACK_DAYS  = _delta
-    else:
-        _lk_map = {
-            "Last 24 hours": (24,  1),
-            "Last 7 days":   (168, 7),
-            "Last 30 days":  (720, 30),
-        }
-        LOOKBACK_HOURS, LOOKBACK_DAYS = _lk_map[time_window]
-        DATE_FROM = _today - dt.timedelta(days=LOOKBACK_DAYS - 1)
-        DATE_TO   = _today
-
     st.divider()
 
     # Reasoner filter — populated from live demand snapshot
@@ -461,7 +464,8 @@ tab_overview, tab_memory, tab_cpu, tab_demand, tab_credits = st.tabs([
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_overview:
-    st.subheader(f"Snapshot — {time_window}")
+    LOOKBACK_HOURS, LOOKBACK_DAYS, DATE_FROM, DATE_TO = _time_controls("overview", default_index=0)
+    st.subheader(f"Snapshot — {DATE_FROM} → {DATE_TO}")
 
     col_mem, col_cpu, col_demand, col_cred = st.columns(4)
 
@@ -517,6 +521,7 @@ with tab_overview:
 
 with tab_memory:
     st.subheader("Memory Utilization")
+    LOOKBACK_HOURS, LOOKBACK_DAYS, _, _ = _time_controls("memory", default_index=0)
     sub_rt, sub_hourly, sub_daily = st.tabs(["Real-Time (5 min)", "Hourly", "Daily Trend"])
 
     with sub_rt:
@@ -570,6 +575,7 @@ with tab_memory:
 
 with tab_cpu:
     st.subheader("CPU Utilization")
+    LOOKBACK_HOURS, _, _, _ = _time_controls("cpu", default_index=0)
     sub_rt, sub_hourly = st.tabs(["Real-Time (5 min)", "Hourly"])
 
     with sub_rt:
@@ -610,6 +616,7 @@ with tab_cpu:
 with tab_demand:
     st.subheader("Reasoner Demand")
     st.caption("Demand > 1.0 indicates jobs are queuing beyond available capacity.")
+    LOOKBACK_HOURS, LOOKBACK_DAYS, _, _ = _time_controls("demand", default_index=0)
     sub_rt, sub_hourly, sub_daily = st.tabs(["Real-Time (5 min)", "Hourly", "Daily Trend"])
 
     with sub_rt:
@@ -665,6 +672,7 @@ with tab_demand:
 
 with tab_credits:
     st.subheader("Snowflake Credits — Compute Pools (RelationalAI)")
+    _, _, DATE_FROM, DATE_TO = _time_controls("credits", default_index=2)  # default: Last 30 days
     st.caption(
         f"Source: `SNOWFLAKE.ACCOUNT_USAGE.SNOWPARK_CONTAINER_SERVICES_HISTORY` | "
         f"Date range: **{DATE_FROM}** → **{DATE_TO}**"
