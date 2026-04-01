@@ -184,6 +184,115 @@ GROUP BY DAY, COMPUTE_POOL_NAME
 ORDER BY DAY ASC
 """
 
+_Q_MARKETPLACE_PAID = """
+SELECT TOP 100 * FROM snowflake.data_sharing_usage.marketplace_paid_usage_daily
+"""
+
+_Q_CREDITS_BREAKDOWN = """
+SELECT
+    USAGE_DATE,
+    CREDITS_USED AS TOTAL_CREDITS,
+    SUM(CASE WHEN b.value:"serviceType"::STRING = 'WAREHOUSE_METERING'
+             THEN b.value:"credits"::NUMBER(38,9) ELSE 0 END) AS WAREHOUSE_METERING_CREDITS,
+    SUM(CASE WHEN b.value:"serviceType"::STRING = 'SERVERLESS_TASK'
+             THEN b.value:"credits"::NUMBER(38,9) ELSE 0 END) AS SERVERLESS_TASK_CREDITS,
+    SUM(CASE WHEN b.value:"serviceType"::STRING = 'SNOWPARK_CONTAINER_SERVICES'
+             THEN b.value:"credits"::NUMBER(38,9) ELSE 0 END) AS SNOWPARK_CONTAINER_SERVICES_CREDITS
+FROM SNOWFLAKE.ACCOUNT_USAGE.APPLICATION_DAILY_USAGE_HISTORY,
+    LATERAL FLATTEN(INPUT => CREDITS_USED_BREAKDOWN, OUTER => TRUE) b
+WHERE APPLICATION_NAME = 'RELATIONALAI'
+  AND USAGE_DATE >= '{date_from}'
+  AND USAGE_DATE <= '{date_to}'
+GROUP BY USAGE_DATE, CREDITS_USED
+ORDER BY USAGE_DATE DESC
+"""
+
+
+# ── SPCS credit rates keyed on instance_family (Service Consumption Table, Apr 2026) ──
+# surcharge_per_hour is the RAI software surcharge in USD/node-hour (None = not applicable)
+_SURCHARGE_RATES: dict[str, tuple[float, float | None]] = {
+    "HIGHMEM_X64_L":  (4.44, 124),
+    "HIGHMEM_X64_SL": (2.93,  92),
+    "HIGHMEM_X64_M":  (1.11,  28),
+    "HIGHMEM_X64_S":  (0.28,   6),
+    "GPU_NV_S":       (0.57,  18),
+    "CPU_X64_M":      (0.22, None),
+    "CPU_X64_S":      (0.11, None),
+    "CPU_X64_XS":     (0.06, None),
+}
+
+
+def _show_compute_pools() -> pd.DataFrame:
+    """Return a DataFrame of compute pools with name, instance_family, application."""
+    if _is_snowflake_environment():
+        df = _get_snowpark_session().sql("SHOW COMPUTE POOLS").to_pandas()
+    else:
+        conn = _get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SHOW COMPUTE POOLS")
+                cols = [d[0] for d in cur.description]
+                df = pd.DataFrame(cur.fetchall(), columns=cols)
+        finally:
+            conn.close()
+    return df[["name", "instance_family", "application"]]
+
+
+def _build_cost_estimate_query(pool_families: pd.DataFrame, date_from: str, date_to: str) -> str:
+    """Build cost-estimate query using live instance_family data, RAI pools only."""
+    rai_pools = pool_families[pool_families["application"] == "RELATIONALAI"]
+    values_rows, family_rows = [], []
+    for _, row in rai_pools.iterrows():
+        pool, family = row["name"], row["instance_family"]
+        family_rows.append(f"        ('{pool}', '{family}')")
+        if family not in _SURCHARGE_RATES:
+            continue
+        credits, surcharge = _SURCHARGE_RATES[family]
+        surcharge_sql = str(surcharge) if surcharge is not None else "NULL"
+        values_rows.append(f"        ('{pool}', {credits}, {surcharge_sql})")
+    if not values_rows:
+        return ""
+    return f"""
+WITH pool_rates AS (
+    SELECT * FROM (VALUES
+{chr(10).join(values_rows)}
+    ) AS t(pool_name, credits_per_hour, surcharge_per_hour)
+),
+pool_families AS (
+    SELECT * FROM (VALUES
+{chr(10).join(family_rows)}
+    ) AS p(pool_name, instance_family)
+),
+consumption AS (
+    SELECT
+        h.START_TIME,
+        h.COMPUTE_POOL_NAME,
+        pf.instance_family,
+        h.CREDITS_USED,
+        r.credits_per_hour,
+        r.surcharge_per_hour,
+        h.CREDITS_USED / NULLIF(r.credits_per_hour, 0)             AS node_hours,
+        (h.CREDITS_USED / NULLIF(r.credits_per_hour, 0))
+            * r.surcharge_per_hour                                  AS projected_surcharge_usd
+    FROM SNOWFLAKE.ACCOUNT_USAGE.SNOWPARK_CONTAINER_SERVICES_HISTORY h
+    JOIN pool_rates r      ON h.COMPUTE_POOL_NAME = r.pool_name
+    LEFT JOIN pool_families pf ON h.COMPUTE_POOL_NAME = pf.pool_name
+    WHERE h.APPLICATION_NAME = 'RELATIONALAI'
+      AND h.START_TIME >= '{date_from}'
+      AND h.START_TIME <  DATEADD(day, 1, '{date_to}')
+)
+SELECT
+    DATE_TRUNC('day', START_TIME)       AS usage_date,
+    COMPUTE_POOL_NAME,
+    instance_family,
+    SUM(CREDITS_USED)                   AS total_credits,
+    SUM(node_hours)                     AS total_node_hours,
+    SUM(projected_surcharge_usd)        AS total_projected_surcharge_usd
+FROM consumption
+GROUP BY 1, 2, 3
+ORDER BY usage_date DESC, total_projected_surcharge_usd DESC NULLS LAST
+"""
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE CONFIG & HELPERS
@@ -562,45 +671,125 @@ with tab_credits:
     )
 
     _df = {"date_from": str(DATE_FROM), "date_to": str(DATE_TO)}
-    df_credits_total = _apply_pool_mapping(fetch(_q(_Q_CREDITS_TOTAL, **_df)))
-    df_credits_daily = _apply_pool_mapping(fetch(_q(_Q_CREDITS_DAILY, **_df)))
 
-    if df_credits_total.empty:
-        st.info("No compute pool credit data found. Ensure your role has access to `SNOWFLAKE.ACCOUNT_USAGE`.")
-    else:
-        k1, k2, k3 = st.columns(3)
-        k1.metric("Total Credits", f"{df_credits_total['CREDITS_USED'].sum():,.2f}")
-        k2.metric("Compute Pools", df_credits_total["COMPUTE_POOL_NAME"].nunique())
-        k3.metric("Highest Consumer",
-                  df_credits_total.loc[df_credits_total["CREDITS_USED"].idxmax(), "COMPUTE_POOL_NAME"])
+    sub_pools, sub_cost, sub_breakdown, sub_marketplace = st.tabs([
+        "By Compute Pool", "Cost Estimate", "Service Type Breakdown", "Marketplace Paid",
+    ])
 
-        st.divider()
+    # ── Sub-tab: By Compute Pool (existing) ───────────────────────────────────
+    with sub_pools:
+        df_credits_total = _apply_pool_mapping(fetch(_q(_Q_CREDITS_TOTAL, **_df)))
+        df_credits_daily = _apply_pool_mapping(fetch(_q(_Q_CREDITS_DAILY, **_df)))
 
-        if not df_credits_daily.empty and "DAY" in df_credits_daily.columns:
-            _pool_order = _pool_category_order(df_credits_daily)
-            fig_trend = px.bar(df_credits_daily, x="DAY", y="CREDITS_USED", color="COMPUTE_POOL_NAME",
-                               barmode="stack",
-                               category_orders={"COMPUTE_POOL_NAME": _pool_order},
-                               labels={"CREDITS_USED": "Credits Used", "DAY": "Date", "COMPUTE_POOL_NAME": "Compute Pool"},
-                               title="Daily Credit Consumption by Compute Pool")
-            daily_total = df_credits_daily.groupby("DAY")["CREDITS_USED"].sum().reset_index()
-            fig_trend.add_trace(go.Scatter(
-                x=daily_total["DAY"], y=daily_total["CREDITS_USED"].cumsum(),
-                name="Cumulative Total", mode="lines+markers",
-                line=dict(color="black", width=2, dash="dot"), yaxis="y2",
-            ))
-            fig_trend.update_layout(
-                yaxis2=dict(overlaying="y", side="right", title="Cumulative Credits", showgrid=False),
-                legend_title="Compute Pool",
-            )
-            st.plotly_chart(fig_trend, width="stretch")
+        if df_credits_total.empty:
+            st.info("No compute pool credit data found. Ensure your role has access to `SNOWFLAKE.ACCOUNT_USAGE`.")
+        else:
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Total Credits", f"{df_credits_total['CREDITS_USED'].sum():,.2f}")
+            k2.metric("Compute Pools", df_credits_total["COMPUTE_POOL_NAME"].nunique())
+            k3.metric("Highest Consumer",
+                      df_credits_total.loc[df_credits_total["CREDITS_USED"].idxmax(), "COMPUTE_POOL_NAME"])
 
-        fig_bar = px.bar(df_credits_total, x="COMPUTE_POOL_NAME", y="CREDITS_USED",
-                         labels={"CREDITS_USED": "Credits Used", "COMPUTE_POOL_NAME": "Compute Pool"},
-                         title="Total Credits by Compute Pool",
-                         color="CREDITS_USED", color_continuous_scale="Blues")
-        st.plotly_chart(fig_bar, width="stretch")
-        st.dataframe(df_credits_total, width="stretch")
+            st.divider()
+
+            if not df_credits_daily.empty and "DAY" in df_credits_daily.columns:
+                _pool_order = _pool_category_order(df_credits_daily)
+                fig_trend = px.bar(df_credits_daily, x="DAY", y="CREDITS_USED", color="COMPUTE_POOL_NAME",
+                                   barmode="stack",
+                                   category_orders={"COMPUTE_POOL_NAME": _pool_order},
+                                   labels={"CREDITS_USED": "Credits Used", "DAY": "Date", "COMPUTE_POOL_NAME": "Compute Pool"},
+                                   title="Daily Credit Consumption by Compute Pool")
+                daily_total = df_credits_daily.groupby("DAY")["CREDITS_USED"].sum().reset_index()
+                fig_trend.add_trace(go.Scatter(
+                    x=daily_total["DAY"], y=daily_total["CREDITS_USED"].cumsum(),
+                    name="Cumulative Total", mode="lines+markers",
+                    line=dict(color="black", width=2, dash="dot"), yaxis="y2",
+                ))
+                fig_trend.update_layout(
+                    yaxis2=dict(overlaying="y", side="right", title="Cumulative Credits", showgrid=False),
+                    legend_title="Compute Pool",
+                )
+                st.plotly_chart(fig_trend, width="stretch")
+
+            fig_bar = px.bar(df_credits_total, x="COMPUTE_POOL_NAME", y="CREDITS_USED",
+                             labels={"CREDITS_USED": "Credits Used", "COMPUTE_POOL_NAME": "Compute Pool"},
+                             title="Total Credits by Compute Pool",
+                             color="CREDITS_USED", color_continuous_scale="Blues")
+            st.plotly_chart(fig_bar, width="stretch")
+            st.dataframe(df_credits_total, width="stretch")
+
+    # ── Sub-tab: Cost Estimate ─────────────────────────────────────────────────
+    with sub_cost:
+        st.caption(
+            "Uses standard list-price surcharge rates (Snowflake Service Consumption Table, Apr 2026). "
+            "Projected USD will differ from invoiced amounts if your account has negotiated pricing. "
+            "RAI surcharge is not applicable to CPU pools (compile cache, modeler, service infrastructure)."
+        )
+        if st.button("Load cost estimate", key="btn_cost_estimate"):
+            with st.spinner("Running SHOW COMPUTE POOLS…"):
+                try:
+                    pool_families = _show_compute_pools()
+                    rai_count = (pool_families["application"] == "RELATIONALAI").sum()
+                    st.caption(f"Found {rai_count} RAI-owned compute pools.")
+                    query = _build_cost_estimate_query(pool_families, str(DATE_FROM), str(DATE_TO))
+                    if not query:
+                        st.warning("No RAI pools with known rates found.")
+                    else:
+                        with st.spinner("Querying usage history…"):
+                            df_cost = fetch(query)
+                        if df_cost.empty:
+                            st.info("No data for the selected date range.")
+                        else:
+                            total_surcharge = df_cost["TOTAL_PROJECTED_SURCHARGE_USD"].sum() if "TOTAL_PROJECTED_SURCHARGE_USD" in df_cost.columns else None
+                            total_credits = df_cost["TOTAL_CREDITS"].sum() if "TOTAL_CREDITS" in df_cost.columns else None
+                            c1, c2 = st.columns(2)
+                            if total_credits is not None:
+                                c1.metric("Total Credits (RAI pools)", f"{total_credits:,.2f}")
+                            if total_surcharge is not None:
+                                c2.metric("Projected Surcharge USD", f"${total_surcharge:,.2f}")
+                            st.divider()
+                            if "USAGE_DATE" in df_cost.columns and "TOTAL_PROJECTED_SURCHARGE_USD" in df_cost.columns:
+                                daily_surcharge = df_cost.groupby("USAGE_DATE")["TOTAL_PROJECTED_SURCHARGE_USD"].sum().reset_index()
+                                fig_cost = px.bar(daily_surcharge, x="USAGE_DATE", y="TOTAL_PROJECTED_SURCHARGE_USD",
+                                                  labels={"TOTAL_PROJECTED_SURCHARGE_USD": "Projected Surcharge (USD)", "USAGE_DATE": "Date"},
+                                                  title="Daily Projected RAI Surcharge (USD)")
+                                st.plotly_chart(fig_cost, width="stretch")
+                            st.dataframe(df_cost, width="stretch")
+                except Exception as exc:
+                    st.error(f"Failed: {exc}")
+
+    # ── Sub-tab: Service Type Breakdown ────────────────────────────────────────
+    with sub_breakdown:
+        st.caption(
+            "Daily credits split across Warehouse Metering, Serverless Tasks, and "
+            "Snowpark Container Services for the RELATIONALAI application."
+        )
+        df_breakdown = fetch(_Q_CREDITS_BREAKDOWN.format(**_df))
+        if df_breakdown.empty:
+            st.info("No data found.")
+        else:
+            numeric_cols = ["WAREHOUSE_METERING_CREDITS", "SERVERLESS_TASK_CREDITS", "SNOWPARK_CONTAINER_SERVICES_CREDITS"]
+            available = [c for c in numeric_cols if c in df_breakdown.columns]
+            if available and "USAGE_DATE" in df_breakdown.columns:
+                df_melt = df_breakdown.melt(id_vars="USAGE_DATE", value_vars=available,
+                                            var_name="Service Type", value_name="Credits")
+                fig_bd = px.bar(df_melt, x="USAGE_DATE", y="Credits", color="Service Type",
+                                barmode="stack",
+                                labels={"USAGE_DATE": "Date"},
+                                title="Daily Credits by Service Type (RELATIONALAI)")
+                st.plotly_chart(fig_bd, width="stretch")
+            st.dataframe(df_breakdown, width="stretch")
+
+    # ── Sub-tab: Marketplace Paid ──────────────────────────────────────────────
+    with sub_marketplace:
+        st.caption("Total RAI usage billed through the Snowflake Marketplace. Only populated on paid accounts.")
+        if st.button("Load marketplace usage", key="btn_marketplace"):
+            with st.spinner("Querying…"):
+                df_mp = fetch(_Q_MARKETPLACE_PAID)
+            if df_mp.empty:
+                st.info("No rows returned — this account may not have paid marketplace usage.")
+            else:
+                st.dataframe(df_mp, width="stretch")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
