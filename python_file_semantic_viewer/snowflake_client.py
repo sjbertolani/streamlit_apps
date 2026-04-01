@@ -118,6 +118,14 @@ class SnowflakeClient:
 
         return [results_map[t] for t in table_list]
 
+    def show_compute_pools(self) -> pd.DataFrame:
+        """Return a DataFrame of all compute pools with name, instance_family, application."""
+        with self._conn.cursor() as cur:
+            cur.execute("SHOW COMPUTE POOLS")
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return pd.DataFrame(rows, columns=cols)[["name", "instance_family", "application"]]
+
     def test_connection(self) -> Dict[str, str]:
         sql = "SELECT CURRENT_USER(), CURRENT_ROLE(), CURRENT_DATABASE(), CURRENT_SCHEMA()"
         with self._conn.cursor() as cur:

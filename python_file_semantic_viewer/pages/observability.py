@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="RAI Observability", layout="wide")
@@ -25,26 +26,58 @@ if not sf_client:
     st.stop()
 
 
-# ── Queries ───────────────────────────────────────────────────────────────────
+# ── RAI surcharge rates keyed on SPCS instance_family ────────────────────────
+# credits_per_hour: Snowflake SPCS list price (Service Consumption Table, Apr 2026)
+# surcharge_per_hour: RAI software surcharge in USD/node-hour (NULL = not applicable)
+_SURCHARGE_RATES: dict[str, tuple[float, float | None]] = {
+    "HIGHMEM_X64_L":  (4.44, 124),
+    "HIGHMEM_X64_SL": (2.93,  92),
+    "HIGHMEM_X64_M":  (1.11,  28),
+    "HIGHMEM_X64_S":  (0.28,   6),
+    "GPU_NV_S":       (0.57,  18),
+    # CPU pools: Snowflake credits known; RAI surcharge not applicable
+    "CPU_X64_M":      (0.22, None),
+    "CPU_X64_S":      (0.11, None),
+    "CPU_X64_XS":     (0.06, None),
+}
 
-_Q_COST_ESTIMATE = """
-WITH surcharge_rates AS (
+
+def _build_cost_query(pool_families: pd.DataFrame, days: int) -> str:
+    """
+    Build the cost-estimate query dynamically using live pool→instance_family
+    data from SHOW COMPUTE POOLS, keyed on instance_family rates.
+    Only includes pools owned by the RELATIONALAI application.
+    """
+    rai_pools = pool_families[pool_families["application"] == "RELATIONALAI"]
+
+    # Build VALUES rows: (pool_name, credits_per_hour, surcharge_per_hour)
+    values_rows = []
+    for _, row in rai_pools.iterrows():
+        pool = row["name"]
+        family = row["instance_family"]
+        if family not in _SURCHARGE_RATES:
+            continue
+        credits, surcharge = _SURCHARGE_RATES[family]
+        surcharge_sql = str(surcharge) if surcharge is not None else "NULL"
+        values_rows.append(f"        ('{pool}', {credits}, {surcharge_sql})")
+
+    if not values_rows:
+        return ""
+
+    values_clause = ",\n".join(values_rows)
+
+    return f"""
+WITH pool_rates AS (
     SELECT * FROM (VALUES
-        ('RELATIONAL_AI_HIGHMEM_X64_L',        4.44, 124),
-        ('RELATIONAL_AI_HIGHMEM_X64_M',        1.11,  28),
-        ('RELATIONAL_AI_HIGHMEM_X64_S',        0.28,   6),
-        ('RELATIONAL_AI_HIGHMEM_X64_SL',       2.93,  92),
-        ('RELATIONAL_AI_HIGHMEM_X64_M_SOLVER', 1.11,  28),
-        ('RELATIONAL_AI_HIGHMEM_X64_S_SOLVER', 0.28,   6),
-        ('RELATIONAL_AI_GPU_NV_S_ML',          0.57,  18),
-        ('RELATIONAL_AI_HIGHMEM_X64_S_ML',     0.28,   6)
-    ) AS t(pool_name_prefix, credits_per_hour, surcharge_per_hour)
+{values_clause}
+    ) AS t(pool_name, credits_per_hour, surcharge_per_hour)
 ),
 consumption AS (
     SELECT
         h.START_TIME,
         h.COMPUTE_POOL_NAME,
         h.APPLICATION_NAME,
+        p.instance_family,
         h.CREDITS_USED,
         r.credits_per_hour,
         r.surcharge_per_hour,
@@ -52,14 +85,17 @@ consumption AS (
         (h.CREDITS_USED / NULLIF(r.credits_per_hour, 0))
             * r.surcharge_per_hour                                  AS projected_surcharge_usd
     FROM SNOWFLAKE.ACCOUNT_USAGE.SNOWPARK_CONTAINER_SERVICES_HISTORY h
-    LEFT JOIN surcharge_rates r
-        ON h.COMPUTE_POOL_NAME ILIKE r.pool_name_prefix || '%'
+    JOIN pool_rates r ON h.COMPUTE_POOL_NAME = r.pool_name
+    LEFT JOIN (VALUES
+{chr(10).join(f"        ('{row['name']}', '{row['instance_family']}')" for _, row in rai_pools.iterrows())}
+    ) AS p(pool_name, instance_family) ON h.COMPUTE_POOL_NAME = p.pool_name
     WHERE h.START_TIME >= DATEADD('day', -{days}, CURRENT_TIMESTAMP())
+      AND h.APPLICATION_NAME = 'RELATIONALAI'
 )
 SELECT
     DATE_TRUNC('day', START_TIME)       AS usage_date,
     COMPUTE_POOL_NAME,
-    APPLICATION_NAME,
+    instance_family,
     SUM(CREDITS_USED)                   AS total_credits,
     SUM(node_hours)                     AS total_node_hours,
     SUM(projected_surcharge_usd)        AS total_projected_surcharge_usd
@@ -67,6 +103,7 @@ FROM consumption
 GROUP BY 1, 2, 3
 ORDER BY usage_date DESC, total_projected_surcharge_usd DESC NULLS LAST
 """
+
 
 _Q_MARKETPLACE_PAID = """
 SELECT TOP 100 * FROM snowflake.data_sharing_usage.marketplace_paid_usage_daily
@@ -113,15 +150,31 @@ def _run(query: str) -> None:
 # ── Section 1: Cost estimate ──────────────────────────────────────────────────
 st.header("Estimated SPCS Cost (last N days)")
 st.caption(
-    "Uses standard list-price surcharge rates. Projected USD will differ from "
-    "invoiced amounts if your account has negotiated pricing."
+    "Only includes pools owned by the RELATIONALAI application. "
+    "Uses standard list-price surcharge rates — projected USD will differ from "
+    "invoiced amounts if your account has negotiated pricing. "
+    "RAI surcharge is not applicable to CPU pools (compile cache, modeler, service)."
 )
 
 days = st.slider("Look-back window (days)", 7, 90, 30, step=7)
 
 if st.button("Run cost estimate", key="btn_cost"):
-    with st.spinner("Querying…"):
-        _run(_Q_COST_ESTIMATE.format(days=days))
+    with st.spinner("Fetching compute pool info…"):
+        try:
+            pool_families = sf_client.show_compute_pools()
+        except Exception as exc:
+            st.error(f"SHOW COMPUTE POOLS failed: {exc}")
+            st.stop()
+
+    rai_pool_count = (pool_families["application"] == "RELATIONALAI").sum()
+    st.caption(f"Found {rai_pool_count} RAI-owned compute pools.")
+
+    query = _build_cost_query(pool_families, days)
+    if not query:
+        st.warning("No RAI pools with known rates found.")
+    else:
+        with st.spinner("Querying usage history…"):
+            _run(query)
 
 st.divider()
 
