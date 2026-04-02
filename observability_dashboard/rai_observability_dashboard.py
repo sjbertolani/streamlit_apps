@@ -208,6 +208,24 @@ ORDER BY USAGE_DATE DESC
 """
 
 
+_Q_STORAGE_USAGE = """
+SELECT
+    USAGE_DATE,
+    ROUND(STORAGE_BYTES  / POWER(1024, 4), 4) AS DATABASE_TB,
+    ROUND(FAILSAFE_BYTES / POWER(1024, 4), 4) AS FAILSAFE_TB,
+    ROUND(STAGE_BYTES    / POWER(1024, 4), 4) AS STAGE_TB,
+    ROUND((STORAGE_BYTES + FAILSAFE_BYTES + STAGE_BYTES) / POWER(1024, 4), 4) AS TOTAL_TB
+FROM SNOWFLAKE.ACCOUNT_USAGE.STORAGE_USAGE
+WHERE USAGE_DATE >= '{date_from}'
+  AND USAGE_DATE <= '{date_to}'
+ORDER BY USAGE_DATE DESC
+"""
+
+# Snowflake list-price storage rates (USD per TB per month)
+_STORAGE_RATE_ONDEMAND  = 40.0
+_STORAGE_RATE_CAPACITY  = 23.0
+
+
 # ── SPCS credit rates keyed on instance_family (Service Consumption Table, Apr 2026) ──
 # surcharge_per_hour is the RAI software surcharge in USD/node-hour (None = not applicable)
 _SURCHARGE_RATES: dict[str, tuple[float, float | None]] = {
@@ -643,8 +661,8 @@ def _tab_credits() -> None:
     )
     _df = {"date_from": str(DATE_FROM), "date_to": str(DATE_TO)}
 
-    sub_pools, sub_cost_breakdown, sub_marketplace = st.tabs([
-        "By Compute Pool", "Cost & Service Breakdown", "Marketplace Paid",
+    sub_cost_breakdown, sub_pools, sub_marketplace = st.tabs([
+        "Cost & Service Breakdown", "By Compute Pool", "Marketplace Paid",
     ])
 
     with sub_pools:
@@ -685,13 +703,113 @@ def _tab_credits() -> None:
             st.dataframe(df_credits_total, width="stretch")
 
     with sub_cost_breakdown:
+        # ── Full service type breakdown ────────────────────────────────────────
+        st.subheader("Full Service Type Breakdown")
+        st.caption("All RELATIONALAI app credits split across SPCS, Warehouse Metering, and Serverless Tasks.")
+        st.info(
+            "**Note:** These credits do not include storage costs. Snowflake does not currently support "
+            "attributing storage usage per native app, so storage cannot be broken out for RelationalAI specifically. "
+            "See the **Account Storage Usage Over Time** section below for account-wide storage tracking — "
+            "spikes there may correlate with RAI activity.",
+            icon="ℹ️",
+        )
+        df_breakdown = fetch(_Q_CREDITS_BREAKDOWN.format(**_df))
+        if df_breakdown.empty:
+            st.info("No data found.")
+        else:
+            numeric_cols = ["WAREHOUSE_METERING_CREDITS", "SERVERLESS_TASK_CREDITS", "SNOWPARK_CONTAINER_SERVICES_CREDITS"]
+            available = [c for c in numeric_cols if c in df_breakdown.columns]
+
+            # Summary metrics
+            spcs_credits = df_breakdown["SNOWPARK_CONTAINER_SERVICES_CREDITS"].sum() if "SNOWPARK_CONTAINER_SERVICES_CREDITS" in df_breakdown.columns else 0.0
+            wh_credits = df_breakdown["WAREHOUSE_METERING_CREDITS"].sum() if "WAREHOUSE_METERING_CREDITS" in df_breakdown.columns else 0.0
+            st_credits = df_breakdown["SERVERLESS_TASK_CREDITS"].sum() if "SERVERLESS_TASK_CREDITS" in df_breakdown.columns else 0.0
+            infra_credits = wh_credits + st_credits
+            total_bd_credits = spcs_credits + infra_credits
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Credits", f"{total_bd_credits:,.2f}")
+            m2.metric("RAI Engine Surcharge (SPCS)", f"{spcs_credits:,.2f}", help="SNOWPARK_CONTAINER_SERVICES credits — the RAI engine compute surcharge")
+            m3.metric("Snowflake Infrastructure", f"{infra_credits:,.2f}", help="Warehouse Metering + Serverless Task credits")
+
+            if available and "USAGE_DATE" in df_breakdown.columns:
+                df_melt = df_breakdown.melt(id_vars="USAGE_DATE", value_vars=available,
+                                            var_name="Service Type", value_name="Credits")
+                fig_bd = px.bar(df_melt, x="USAGE_DATE", y="Credits", color="Service Type",
+                                barmode="stack", labels={"USAGE_DATE": "Date"},
+                                title="Daily Credits by Service Type (RELATIONALAI)")
+                st.plotly_chart(fig_bd, width="stretch")
+            st.dataframe(df_breakdown, width="stretch")
+
+        # ── Storage credit usage over time ─────────────────────────────────────
+        st.divider()
+        st.subheader("Account Storage Usage Over Time")
+        st.caption(
+            "Account-level storage across databases, stages, and fail-safe — measured in TB. "
+            "RelationalAI uses randomly-named stages for model storage; spikes here may correlate "
+            "with RAI activity but cannot be attributed directly."
+        )
+        df_storage = fetch(_Q_STORAGE_USAGE.format(**_df))
+        if df_storage.empty:
+            st.info("No storage data for the selected date range.")
+        else:
+            storage_cols = ["DATABASE_TB", "FAILSAFE_TB", "STAGE_TB"]
+            available_s = [c for c in storage_cols if c in df_storage.columns]
+
+            # Cost estimate — pick rate via radio
+            storage_rate = st.radio(
+                "Pricing tier",
+                options=[f"On-Demand (${_STORAGE_RATE_ONDEMAND:.0f}/TB/mo)", f"Capacity (${_STORAGE_RATE_CAPACITY:.0f}/TB/mo)"],
+                horizontal=True,
+                key="storage_rate_radio",
+            )
+            rate = _STORAGE_RATE_ONDEMAND if "On-Demand" in storage_rate else _STORAGE_RATE_CAPACITY
+            st.caption("List-price estimates only. Actual invoiced amounts depend on your Snowflake contract.")
+
+            if "TOTAL_TB" in df_storage.columns:
+                df_storage = df_storage.copy()
+                df_storage["EST_DAILY_COST_USD"] = (df_storage["TOTAL_TB"] * rate / 30).round(2)
+                total_est = df_storage["EST_DAILY_COST_USD"].sum()
+                latest = df_storage.iloc[0]
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Latest Total Storage (TB)", f"{latest['TOTAL_TB']:,.4f}")
+                c2.metric("Latest Est. Daily Cost", f"${latest['EST_DAILY_COST_USD']:,.2f}")
+                c3.metric(f"Est. Total Cost ({DATE_FROM} → {DATE_TO})", f"${total_est:,.2f}")
+
+            if available_s and "USAGE_DATE" in df_storage.columns:
+                df_smelt = df_storage.melt(id_vars="USAGE_DATE", value_vars=available_s,
+                                           var_name="Storage Type", value_name="TB")
+                fig_storage = px.area(df_smelt, x="USAGE_DATE", y="TB", color="Storage Type",
+                                      labels={"USAGE_DATE": "Date", "TB": "Terabytes"},
+                                      title="Daily Average Storage by Type (Account-Wide)")
+                st.plotly_chart(fig_storage, width="stretch")
+
+            if "EST_DAILY_COST_USD" in df_storage.columns and "USAGE_DATE" in df_storage.columns:
+                fig_cost_s = px.bar(df_storage, x="USAGE_DATE", y="EST_DAILY_COST_USD",
+                                    labels={"USAGE_DATE": "Date", "EST_DAILY_COST_USD": "Est. Daily Cost (USD)"},
+                                    title="Estimated Daily Storage Cost (USD)")
+                st.plotly_chart(fig_cost_s, width="stretch")
+
+            st.dataframe(df_storage, width="stretch")
+
         # ── RAI engine cost estimate ───────────────────────────────────────────
+        st.divider()
         st.subheader("RAI Engine Cost Estimate")
         st.caption(
             "RAI-owned compute pools only. Uses standard list-price surcharge rates "
             "(Snowflake Service Consumption Table, Apr 2026). "
             "Projected USD will differ from invoiced amounts if your account has negotiated pricing. "
             "RAI surcharge is not applicable to CPU pools."
+        )
+        st.info(
+            "**Why does 'Total Credits (RAI pools)' differ from 'RAI Engine Surcharge (SPCS)' above?** "
+            "These two figures use different source tables. The number above comes from "
+            "`APPLICATION_DAILY_USAGE_HISTORY` — the native app's self-reported credit breakdown. "
+            "The number here comes from `METERING_HISTORY` — Snowflake's direct metering of the "
+            "underlying compute pools. Small differences (~1–2%) are expected due to rounding, "
+            "attribution timing, or credits that appear in pool metering before they are reflected "
+            "in the app usage history. Neither value is wrong; they are two different lenses on the "
+            "same underlying activity.",
+            icon="ℹ️",
         )
         with st.spinner("Loading cost estimate…"):
             try:
@@ -723,25 +841,6 @@ def _tab_credits() -> None:
                         st.dataframe(df_cost, width="stretch")
             except Exception as exc:
                 st.error(f"Failed: {exc}")
-
-        # ── Full service type breakdown ────────────────────────────────────────
-        st.divider()
-        st.subheader("Full Service Type Breakdown")
-        st.caption("All RELATIONALAI app credits split across SPCS, Warehouse Metering, and Serverless Tasks.")
-        df_breakdown = fetch(_Q_CREDITS_BREAKDOWN.format(**_df))
-        if df_breakdown.empty:
-            st.info("No data found.")
-        else:
-            numeric_cols = ["WAREHOUSE_METERING_CREDITS", "SERVERLESS_TASK_CREDITS", "SNOWPARK_CONTAINER_SERVICES_CREDITS"]
-            available = [c for c in numeric_cols if c in df_breakdown.columns]
-            if available and "USAGE_DATE" in df_breakdown.columns:
-                df_melt = df_breakdown.melt(id_vars="USAGE_DATE", value_vars=available,
-                                            var_name="Service Type", value_name="Credits")
-                fig_bd = px.bar(df_melt, x="USAGE_DATE", y="Credits", color="Service Type",
-                                barmode="stack", labels={"USAGE_DATE": "Date"},
-                                title="Daily Credits by Service Type (RELATIONALAI)")
-                st.plotly_chart(fig_bd, width="stretch")
-            st.dataframe(df_breakdown, width="stretch")
 
     with sub_marketplace:
         st.caption("Total RAI usage billed through the Snowflake Marketplace. Only populated on paid accounts.")
