@@ -643,8 +643,8 @@ def _tab_credits() -> None:
     )
     _df = {"date_from": str(DATE_FROM), "date_to": str(DATE_TO)}
 
-    sub_pools, sub_cost, sub_breakdown, sub_marketplace = st.tabs([
-        "By Compute Pool", "Cost Estimate", "Service Type Breakdown", "Marketplace Paid",
+    sub_pools, sub_cost_breakdown, sub_marketplace = st.tabs([
+        "By Compute Pool", "Cost & Service Breakdown", "Marketplace Paid",
     ])
 
     with sub_pools:
@@ -684,11 +684,14 @@ def _tab_credits() -> None:
             st.plotly_chart(fig_bar, width="stretch")
             st.dataframe(df_credits_total, width="stretch")
 
-    with sub_cost:
+    with sub_cost_breakdown:
+        # ── RAI engine cost estimate ───────────────────────────────────────────
+        st.subheader("RAI Engine Cost Estimate")
         st.caption(
-            "Uses standard list-price surcharge rates (Snowflake Service Consumption Table, Apr 2026). "
+            "RAI-owned compute pools only. Uses standard list-price surcharge rates "
+            "(Snowflake Service Consumption Table, Apr 2026). "
             "Projected USD will differ from invoiced amounts if your account has negotiated pricing. "
-            "RAI surcharge is not applicable to CPU pools (compile cache, modeler, service infrastructure)."
+            "RAI surcharge is not applicable to CPU pools."
         )
         with st.spinner("Loading cost estimate…"):
             try:
@@ -721,11 +724,10 @@ def _tab_credits() -> None:
             except Exception as exc:
                 st.error(f"Failed: {exc}")
 
-    with sub_breakdown:
-        st.caption(
-            "Daily credits split across Warehouse Metering, Serverless Tasks, and "
-            "Snowpark Container Services for the RELATIONALAI application."
-        )
+        # ── Full service type breakdown ────────────────────────────────────────
+        st.divider()
+        st.subheader("Full Service Type Breakdown")
+        st.caption("All RELATIONALAI app credits split across SPCS, Warehouse Metering, and Serverless Tasks.")
         df_breakdown = fetch(_Q_CREDITS_BREAKDOWN.format(**_df))
         if df_breakdown.empty:
             st.info("No data found.")
