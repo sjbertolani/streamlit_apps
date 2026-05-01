@@ -1,0 +1,9 @@
+streamlit>=1.33.0
+snowflake-connector-python>=3.7.0
+pandas>=2.0.0
+numpy>=1.24.0
+networkx>=3.0
+gravis>=0.1.0
+matplotlib>=3.7.0
+httpx>=0.24.0
+relationalai>=1.0.0
